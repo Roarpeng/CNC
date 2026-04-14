@@ -1,6 +1,6 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import axios from 'axios';
-import { UploadCloud, Settings, Play, Download, AlertTriangle, Box, Ruler, Layers, CheckCircle2, Loader2, Move3d, Crosshair, Eye, EyeOff } from 'lucide-react';
+import { UploadCloud, Settings, Play, Download, AlertTriangle, Box, Ruler, Layers, CheckCircle2, Loader2, Move3d, Crosshair, Eye, EyeOff, RotateCw, FolderClock } from 'lucide-react';
 import type { InteractionMode, SelectedFace, MeasureResult } from './components/ModelViewer';
 import type { ToolpathSegment } from './components/ToolpathViewer';
 import ModelViewer from './components/ModelViewer';
@@ -11,11 +11,74 @@ const API = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
 
 type Status = 'idle' | 'uploading' | 'uploaded' | 'generating' | 'done' | 'error';
 
+type JobSnapshot = {
+  job_id: string;
+  filename: string;
+  status: string;
+  stage?: string | null;
+  progress?: number | null;
+  error_code?: string | null;
+  error_message?: string | null;
+  gcode_url?: string | null;
+  render_url?: string | null;
+  topology?: any;
+  cam_result?: {
+    estimated_time_minutes?: number;
+    stats?: Record<string, unknown>;
+    toolpath_segments?: ToolpathSegment[];
+  } | null;
+  created_at?: string;
+  updated_at?: string;
+};
+
+function mapJobStatus(status?: string): Status {
+  if (status === 'done') return 'done';
+  if (status === 'failed') return 'error';
+  if (status === 'generating') return 'generating';
+  if (status === 'parsed' || status === 'parsed_mock' || status === 'uploaded') return 'uploaded';
+  return 'idle';
+}
+
+function formatJobStatus(status?: string) {
+  switch (status) {
+    case 'done': return '已完成';
+    case 'failed': return '失败';
+    case 'generating': return '生成中';
+    case 'parsing': return '解析中';
+    case 'parsed_mock': return '解析完成(降级)';
+    case 'parsed': return '解析完成';
+    case 'queued': return '排队中';
+    case 'uploaded': return '已上传';
+    default: return '待处理';
+  }
+}
+
+function formatStage(stage?: string | null) {
+  switch (stage) {
+    case 'queued': return '等待';
+    case 'parsing': return '解析';
+    case 'meshing': return '网格化';
+    case 'cam': return '刀路';
+    case 'completed': return '完成';
+    default: return '未开始';
+  }
+}
+
+function formatJobTime(value?: string) {
+  if (!value) return '未知';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '未知';
+  return date.toLocaleString('zh-CN', { hour12: false });
+}
+
 function App() {
   const [file, setFile] = useState<File | null>(null);
   const [status, setStatus] = useState<Status>('idle');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [modelData, setModelData] = useState<any>(null);
+  const [currentJob, setCurrentJob] = useState<JobSnapshot | null>(null);
+  const [recentJobs, setRecentJobs] = useState<JobSnapshot[]>([]);
+  const [jobsLoading, setJobsLoading] = useState(false);
   const [craftsmanParams, setCraftsmanParams] = useState<any>(null);
   const [gcodeResult, setGcodeResult] = useState<any>(null);
 
@@ -34,6 +97,66 @@ function App() {
     rough_tool_id: 1,
   });
 
+  useEffect(() => {
+    void loadRecentJobs();
+  }, []);
+
+  const syncJobToUi = (job: JobSnapshot) => {
+    setCurrentJob(job);
+    setStatus(mapJobStatus(job.status));
+    setErrorMsg(job.error_message ? `${job.error_code ? `[${job.error_code}] ` : ''}${job.error_message}` : null);
+
+    if (job.render_url || job.topology) {
+      setModelData({
+        job_id: job.job_id,
+        render_url: job.render_url,
+        topology: job.topology,
+      });
+    }
+
+    const restoredCam = job.gcode_url || job.cam_result
+      ? {
+          estimated_time_minutes: job.cam_result?.estimated_time_minutes,
+          gcode_url: job.gcode_url,
+          stats: job.cam_result?.stats,
+          toolpath_segments: job.cam_result?.toolpath_segments ?? [],
+        }
+      : null;
+
+    setGcodeResult(restoredCam);
+    setToolpathSegments(restoredCam?.toolpath_segments ?? []);
+    setSelectedFace(null);
+    setMeasureResult(null);
+  };
+
+  const loadRecentJobs = async () => {
+    setJobsLoading(true);
+    try {
+      const res = await axios.get(`${API}/api/v1/jobs/recent`, { params: { limit: 8 } });
+      setRecentJobs(res.data.items ?? []);
+    } catch (err) {
+      console.error('Load recent jobs failed', err);
+    } finally {
+      setJobsLoading(false);
+    }
+  };
+
+  const loadJobDetail = async (jobId: string) => {
+    try {
+      const res = await axios.get(`${API}/api/v1/jobs/${jobId}`);
+      syncJobToUi(res.data);
+      if (res.data.topology?.features) {
+        void fetchCraftsmanAdvice(res.data.topology.features);
+      } else {
+        setCraftsmanParams(null);
+      }
+    } catch (err: any) {
+      const detail = err?.response?.data?.detail || err?.message || '读取作业失败';
+      setErrorMsg(detail);
+      setStatus('error');
+    }
+  };
+
   const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     if (!e.target.files || e.target.files.length === 0) return;
     const selectedFile = e.target.files[0];
@@ -51,15 +174,19 @@ function App() {
     setGcodeResult(null);
     setCraftsmanParams(null);
     setModelData(null);
+    setCurrentJob(null);
+    setToolpathSegments([]);
 
     const formData = new FormData();
     formData.append('file', selectedFile);
 
     try {
       const res = await axios.post(`${API}/api/v1/upload/`, formData);
-      setModelData(res.data);
-      setStatus('uploaded');
-      fetchCraftsmanAdvice(res.data.topology.features);
+      syncJobToUi(res.data);
+      if (res.data.topology?.features) {
+        void fetchCraftsmanAdvice(res.data.topology.features);
+      }
+      await loadRecentJobs();
     } catch (err: any) {
       const detail = err?.response?.data?.detail || err?.message || '上传失败';
       setErrorMsg(detail);
@@ -108,6 +235,24 @@ function App() {
         setToolpathSegments(res.data.toolpath_segments);
       }
       setStatus('done');
+      const nextJob: JobSnapshot = {
+        ...(currentJob ?? {} as JobSnapshot),
+        job_id: modelData.job_id,
+        filename: currentJob?.filename ?? file?.name ?? '未命名文件',
+        status: res.data.job_status ?? 'done',
+        stage: res.data.stage ?? 'completed',
+        progress: res.data.progress ?? 100,
+        gcode_url: res.data.gcode_url,
+        render_url: modelData.render_url,
+        topology: modelData.topology,
+        cam_result: {
+          estimated_time_minutes: res.data.estimated_time_minutes,
+          stats: res.data.stats,
+          toolpath_segments: res.data.toolpath_segments ?? [],
+        },
+      };
+      setCurrentJob(nextJob);
+      await loadRecentJobs();
     } catch (err: any) {
       const detail = err?.response?.data?.detail || err?.message || 'G-Code 生成失败';
       setErrorMsg(detail);
@@ -116,6 +261,7 @@ function App() {
   };
 
   const features = modelData?.topology?.features;
+  const currentProgress = currentJob?.progress ?? (status === 'done' ? 100 : status === 'uploaded' ? 100 : 0);
 
   return (
     <div className="flex h-screen w-screen text-slate-200">
@@ -161,6 +307,38 @@ function App() {
             <div className="flex items-start gap-2 bg-red-950/40 border border-red-500/30 rounded-lg p-3 text-xs text-red-300">
               <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
               <span>{errorMsg}</span>
+            </div>
+          )}
+
+          {currentJob && (
+            <div className="bg-slate-900/70 rounded-lg border border-slate-700 p-4 space-y-3">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-[11px] uppercase tracking-[0.24em] text-slate-500">当前作业</div>
+                  <div className="mt-1 text-sm font-semibold text-slate-100 truncate">{currentJob.filename}</div>
+                </div>
+                <StatusBadge status={currentJob.status} />
+              </div>
+
+              <div className="grid grid-cols-2 gap-3 text-xs">
+                <InfoItem label="阶段" value={formatStage(currentJob.stage)} />
+                <InfoItem label="进度" value={`${currentProgress}%`} />
+                <InfoItem label="作业 ID" value={currentJob.job_id.slice(0, 8)} mono />
+                <InfoItem label="更新时间" value={formatJobTime(currentJob.updated_at)} />
+              </div>
+
+              <div className="h-2 rounded-full bg-slate-800 overflow-hidden">
+                <div
+                  className={`h-full rounded-full transition-all ${currentJob.status === 'failed' ? 'bg-red-500' : currentJob.status === 'done' ? 'bg-emerald-500' : 'bg-cyan-500'}`}
+                  style={{ width: `${Math.max(6, Math.min(100, currentProgress))}%` }}
+                />
+              </div>
+
+              {currentJob.status === 'parsed_mock' && (
+                <div className="rounded-lg border border-amber-500/30 bg-amber-950/30 px-3 py-2 text-[11px] text-amber-300">
+                  当前模型使用了降级解析结果，适合内部联调和流程验证，正式加工前建议复核网格。
+                </div>
+              )}
             </div>
           )}
 
@@ -240,6 +418,65 @@ function App() {
               </a>
             </div>
           )}
+
+          <div className="bg-slate-900/60 rounded-lg border border-slate-700 p-4 space-y-3">
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2">
+                <FolderClock className="w-4 h-4 text-cyan-400" />
+                <h3 className="text-sm font-semibold text-slate-200">最近作业</h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => void loadRecentJobs()}
+                className="inline-flex items-center gap-1 rounded-md border border-slate-700 px-2 py-1 text-[11px] text-slate-400 transition-colors hover:border-cyan-500/40 hover:text-cyan-300"
+              >
+                <RotateCw className={`w-3.5 h-3.5 ${jobsLoading ? 'animate-spin' : ''}`} />
+                刷新
+              </button>
+            </div>
+
+            <div className="space-y-2 max-h-56 overflow-y-auto pr-1 custom-scrollbar">
+              {recentJobs.length === 0 && !jobsLoading && (
+                <div className="rounded-lg border border-dashed border-slate-700 px-3 py-4 text-center text-xs text-slate-500">
+                  暂无历史作业，上传一个 STEP 文件后会显示在这里。
+                </div>
+              )}
+
+              {recentJobs.map((job) => (
+                <button
+                  key={job.job_id}
+                  type="button"
+                  onClick={() => void loadJobDetail(job.job_id)}
+                  className={`w-full rounded-lg border px-3 py-3 text-left transition-all ${currentJob?.job_id === job.job_id ? 'border-cyan-500/50 bg-cyan-950/20' : 'border-slate-700 bg-slate-950/40 hover:border-slate-500'}`}
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="truncate text-sm font-medium text-slate-100">{job.filename}</div>
+                      <div className="mt-1 text-[11px] text-slate-500">{formatJobTime(job.updated_at || job.created_at)}</div>
+                    </div>
+                    <StatusBadge status={job.status} compact />
+                  </div>
+
+                  <div className="mt-3 flex items-center justify-between text-[11px] text-slate-400">
+                    <span>阶段: {formatStage(job.stage)}</span>
+                    <span>{job.progress ?? 0}%</span>
+                  </div>
+                  <div className="mt-1 h-1.5 rounded-full bg-slate-800 overflow-hidden">
+                    <div
+                      className={`h-full rounded-full ${job.status === 'failed' ? 'bg-red-500' : job.status === 'done' ? 'bg-emerald-500' : 'bg-cyan-500'}`}
+                      style={{ width: `${Math.max(4, Math.min(100, job.progress ?? 0))}%` }}
+                    />
+                  </div>
+
+                  {job.error_message && (
+                    <div className="mt-2 line-clamp-2 text-[11px] text-red-300">
+                      {job.error_code ? `${job.error_code}: ` : ''}{job.error_message}
+                    </div>
+                  )}
+                </button>
+              ))}
+            </div>
+          </div>
         </div>
 
         {/* 底部生成按钮 */}
@@ -347,6 +584,31 @@ function App() {
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+function StatusBadge({ status, compact = false }: { status?: string; compact?: boolean }) {
+  const classes = status === 'done'
+    ? 'border-emerald-500/30 bg-emerald-950/40 text-emerald-300'
+    : status === 'failed'
+      ? 'border-red-500/30 bg-red-950/40 text-red-300'
+      : status === 'parsed_mock'
+        ? 'border-amber-500/30 bg-amber-950/40 text-amber-300'
+        : 'border-cyan-500/30 bg-cyan-950/30 text-cyan-300';
+
+  return (
+    <span className={`inline-flex items-center rounded-full border py-1 text-[11px] font-medium ${compact ? 'px-2' : 'px-2.5'} ${classes}`}>
+      {formatJobStatus(status)}
+    </span>
+  );
+}
+
+function InfoItem({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) {
+  return (
+    <div className="rounded-lg border border-slate-800 bg-slate-950/40 px-3 py-2">
+      <div className="text-[11px] text-slate-500">{label}</div>
+      <div className={`mt-1 text-xs text-slate-100 ${mono ? 'font-mono' : ''}`}>{value}</div>
     </div>
   );
 }

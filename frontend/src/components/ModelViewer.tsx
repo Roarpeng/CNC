@@ -105,14 +105,12 @@ function PointMarker({ point }: { point: THREE.Vector3 }) {
 
 /* ===== 交互式模型 ===== */
 function InteractiveModel({
-  url, mode, onFaceSelect, onMeasure, selectedFace, measurePoints, setMeasurePoints,
+  url, mode, onFaceSelect, onMeasure, setMeasurePoints,
 }: {
   url: string;
   mode: InteractionMode;
   onFaceSelect?: (face: SelectedFace) => void;
   onMeasure?: (result: MeasureResult) => void;
-  selectedFace?: SelectedFace | null;
-  measurePoints: THREE.Vector3[];
   setMeasurePoints: React.Dispatch<React.SetStateAction<THREE.Vector3[]>>;
 }) {
   const ext = useMemo(() => url.split('?')[0].split('.').pop()?.toLowerCase() ?? 'obj', [url]);
@@ -194,7 +192,7 @@ function InteractiveModel({
 
 /* ===== 主组件 ===== */
 export default function ModelViewer({
-  renderUrl, topology, mode, toolpathSegments, showToolpath = true,
+  renderUrl, mode, toolpathSegments, showToolpath = true,
   onFaceSelect, onMeasure, selectedFace,
 }: ModelViewerProps) {
   const [measurePoints, setMeasurePoints] = useState<THREE.Vector3[]>([]);
@@ -210,8 +208,6 @@ export default function ModelViewer({
             mode={mode}
             onFaceSelect={onFaceSelect}
             onMeasure={onMeasure}
-            selectedFace={selectedFace}
-            measurePoints={measurePoints}
             setMeasurePoints={setMeasurePoints}
           />
         </Stage>

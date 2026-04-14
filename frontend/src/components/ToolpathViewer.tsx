@@ -45,9 +45,7 @@ export default function ToolpathViewer({ segments, visible = true }: ToolpathVie
           <bufferGeometry>
             <bufferAttribute
               attach="attributes-position"
-              array={rapidLines}
-              count={rapidLines.length / 3}
-              itemSize={3}
+              args={[rapidLines, 3]}
             />
           </bufferGeometry>
           <lineDashedMaterial
@@ -67,9 +65,7 @@ export default function ToolpathViewer({ segments, visible = true }: ToolpathVie
           <bufferGeometry>
             <bufferAttribute
               attach="attributes-position"
-              array={feedLines}
-              count={feedLines.length / 3}
-              itemSize={3}
+              args={[feedLines, 3]}
             />
           </bufferGeometry>
           <lineBasicMaterial color={COLORS.G1} linewidth={2} />

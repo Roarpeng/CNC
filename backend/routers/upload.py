@@ -1,3 +1,4 @@
+import json
 import uuid
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
 from pathlib import Path
@@ -12,6 +13,10 @@ UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 MAX_FILE_SIZE = 100 * 1024 * 1024  # 100 MB
+
+
+def _write_json(path: Path, payload: dict) -> None:
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
 @router.post("/upload/")
 async def upload_step_file(file: UploadFile = File(...), db: Session = Depends(get_db)):
@@ -48,6 +53,7 @@ async def upload_step_file(file: UploadFile = File(...), db: Session = Depends(g
         db.commit()
 
         topology_data = parse_step_with_cadquery(str(file_path), str(output_dir))
+        _write_json(output_dir / "topology.json", topology_data)
         job.status = "parsed"
         job.stage = "meshing"
         job.progress = 100
@@ -74,6 +80,7 @@ async def upload_step_file(file: UploadFile = File(...), db: Session = Depends(g
             ],
             "render_file": "mock_model.obj"
         }
+        _write_json(output_dir / "topology.json", topology_data)
         job.status = "parsed_mock"
         job.stage = "meshing"
         job.progress = 100
@@ -87,6 +94,12 @@ async def upload_step_file(file: UploadFile = File(...), db: Session = Depends(g
     return {
         "message": "File parsed successfully (Mocked if warning shown)",
         "job_id": job_id,
+        "filename": file.filename,
+        "status": job.status,
+        "stage": job.stage,
+        "progress": job.progress,
+        "error_code": job.error_code,
+        "error_message": job.error_message,
         "render_url": render_url,
         "topology": topology_data
     }

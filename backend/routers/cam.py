@@ -1,3 +1,4 @@
+import json
 import os
 from pathlib import Path
 from fastapi import APIRouter, HTTPException, Depends
@@ -13,6 +14,10 @@ router = APIRouter()
 SAFE_Z = 5.0        # 安全高度
 TOOL_DIAMETER = 6.0  # 默认刀具直径 mm
 STEP_OVER_RATIO = 0.4  # 行距 = 刀具直径 * 比例
+
+
+def _write_json(path: Path, payload: dict) -> None:
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
 class GenerateRequest(BaseModel):
     job_id: str
@@ -93,6 +98,11 @@ async def generate_toolpath(req: GenerateRequest, db: Session = Depends(get_db))
     try:
         with open(os.path.join(job_dir, "output.nc"), "w") as f:
             f.write("\n".join(gcode_lines) + "\n")
+        _write_json(Path(job_dir) / "cam_result.json", {
+            "estimated_time_minutes": cam_result["estimated_time_minutes"],
+            "stats": cam_result["stats"],
+            "toolpath_segments": toolpath_segments,
+        })
         job.status = "done"
         job.stage = "completed"
         job.progress = 100
@@ -122,7 +132,11 @@ async def generate_toolpath(req: GenerateRequest, db: Session = Depends(get_db))
     db.commit()
 
     return {
+        "job_id": req.job_id,
         "status": "success",
+        "job_status": job.status,
+        "stage": job.stage,
+        "progress": job.progress,
         "estimated_time_minutes": cam_result["estimated_time_minutes"],
         "gcode_url": gcode_path,
         "toolpath_segments": toolpath_segments,
