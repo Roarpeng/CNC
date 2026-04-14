@@ -2,6 +2,8 @@ import { Suspense, useMemo, useState, useCallback } from 'react';
 import { Canvas, type ThreeEvent } from '@react-three/fiber';
 import { OrbitControls, Stage, GizmoHelper, GizmoViewport, Html, Line } from '@react-three/drei';
 import { OBJLoader } from 'three-stdlib';
+import { STLLoader } from 'three-stdlib';
+import { GLTFLoader } from 'three-stdlib';
 import { useLoader } from '@react-three/fiber';
 import * as THREE from 'three';
 import ToolpathViewer, { type ToolpathSegment } from './ToolpathViewer';
@@ -113,7 +115,17 @@ function InteractiveModel({
   measurePoints: THREE.Vector3[];
   setMeasurePoints: React.Dispatch<React.SetStateAction<THREE.Vector3[]>>;
 }) {
-  const obj = useLoader(OBJLoader, url) as THREE.Group;
+  const ext = useMemo(() => url.split('?')[0].split('.').pop()?.toLowerCase() ?? 'obj', [url]);
+  const loaderClass = useMemo(() => {
+    if (ext === 'stl') return STLLoader;
+    if (ext === 'glb' || ext === 'gltf') return GLTFLoader;
+    return OBJLoader;
+  }, [ext]);
+  const loaded = useLoader(loaderClass as any, url) as THREE.Group | THREE.BufferGeometry | { scene: THREE.Group };
+  const object3d = useMemo(() => {
+    if ((loaded as { scene?: THREE.Group }).scene) return (loaded as { scene: THREE.Group }).scene;
+    return loaded as THREE.Group | THREE.BufferGeometry;
+  }, [loaded]);
 
   const material = useMemo(() => new THREE.MeshStandardMaterial({
     color: '#94a3b8',
@@ -123,12 +135,14 @@ function InteractiveModel({
   }), []);
 
   useMemo(() => {
-    obj.traverse((child) => {
-      if ((child as THREE.Mesh).isMesh) {
-        (child as THREE.Mesh).material = material;
-      }
-    });
-  }, [obj, material]);
+    if (object3d instanceof THREE.Group) {
+      object3d.traverse((child) => {
+        if ((child as THREE.Mesh).isMesh) {
+          (child as THREE.Mesh).material = material;
+        }
+      });
+    }
+  }, [object3d, material]);
 
   const handleClick = useCallback((e: ThreeEvent<MouseEvent>) => {
     e.stopPropagation();
@@ -169,7 +183,11 @@ function InteractiveModel({
 
   return (
     <group onClick={handleClick}>
-      <primitive object={obj} />
+      {object3d instanceof THREE.BufferGeometry ? (
+        <mesh geometry={object3d} material={material} />
+      ) : (
+        <primitive object={object3d} />
+      )}
     </group>
   );
 }

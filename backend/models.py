@@ -46,5 +46,10 @@ class Job(Base):
     id = Column(String, primary_key=True, index=True) # 使用UUID作为任务ID
     filename = Column(String)
     status = Column(String) # 状态: uploaded, toolpath_generating, done, failed
+    stage = Column(String, nullable=True) # 子阶段: parsing, meshing, cam, postprocessing
+    progress = Column(Integer, default=0) # 0-100
+    error_code = Column(String, nullable=True)
+    error_message = Column(String, nullable=True)
     gcode_url = Column(String, nullable=True) # 最终产物下载路径
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

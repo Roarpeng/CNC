@@ -1,6 +1,10 @@
 # Cloud CAM 工业级云端加工管理平台系统规范 (Spec)
 
-> **最后更新**: 2026-04-13
+> **最后更新**: 2026-04-14
+
+## 0. 关联文档
+
+- SaaS 工业化改造 RFC: [rfc-saas-industrialization.md](rfc-saas-industrialization.md)
 
 ## 1. 项目愿景与定位
 本项目定位于"**基于 Web 的计算机辅助制造 (Cloud CAM) 平台与专家推荐系统**"。旨在改变传统加工行业必须在重型本地工控机上打开复杂 CAM 软件的现状，允许用户通过浏览器直接预览、测量并生成 CNC 刀路，同时借助系统内置的加工历史实现"工艺大师"的辅助参数推荐。
@@ -14,7 +18,7 @@
 * **主框架**: `React 19` + `Vite 8` 构建的超速轻量化前端。
 * **语言规范**: `TypeScript 6` + 严格检查 (`verbatimModuleSyntax`)。
 * **样式引擎**: `TailwindCSS v4` (通过 `@tailwindcss/vite` 插件集成)，以暗色系 (`Slate-900`) 为主的现代工业质感 UI。
-* **3D 驱动渲染**: 围绕 `Three.js 0.183` 生态群（`@react-three/fiber 9` 声明式引擎 与 `@react-three/drei 10` 特效库），完成了 OBJ 网格模型载入和工业化影棚 (`<Stage>`) 渲染展示。
+* **3D 驱动渲染**: 围绕 `Three.js 0.183` 生态群（`@react-three/fiber 9` 声明式引擎 与 `@react-three/drei 10` 特效库），完成了 OBJ/STL 网格模型载入和工业化影棚 (`<Stage>`) 渲染展示。
 * **图标体系**: `lucide-react` 提供统一的线条图标。
 * **HTTP 客户端**: `axios`，通过环境变量 `VITE_API_BASE_URL` 配置 API 地址。
 
@@ -61,9 +65,9 @@
 #### 2.2.1 后端路由 API
 | 路由 | 方法 | 职责 |
 | :--- | :--- | :--- |
-| `/api/v1/upload/` | POST | 上传 STEP 文件 → FreeCAD 解析 → 返回 OBJ URL + 拓扑数据 |
+| `/api/v1/upload/` | POST | 上传 STEP 文件 → CadQuery 解析 → 返回 STL/OBJ URL + 拓扑数据 |
 | `/api/v1/craftsman/recommend/` | GET | 输入 volume + max_depth → 欧氏距离最近邻 → 返回推荐工艺参数 |
-| `/api/v1/cam/generate/` | POST | 输入工艺参数 + 模型 bbox → 多层 zigzag 粗加工 → 返回 G-Code + 刀路分段 |
+| `/api/v1/cam/generate/` | POST | 输入工艺参数 + 模型 bbox → OpenCAMLib Drop-cutter (降级兜底) → 返回 G-Code + 刀路分段 |
 
 #### 2.2.2 后端关键文件
 | 文件路径 | 职责 |
@@ -71,37 +75,38 @@
 | `main.py` | FastAPI 应用入口，CORS、静态文件、路由注册 |
 | `database.py` | SQLAlchemy 引擎、Session 管理 |
 | `models.py` | ORM 模型定义 (Job, CAMRecord, ToolCard) |
-| `routers/upload.py` | 上传路由：文件校验、FreeCAD 子进程、Mock 降级 (含 OBJ 方盒生成) |
-| `routers/cam.py` | CAM 路由：基于真实 bbox 的多层 zigzag 刀路生成 + G-Code 输出 |
+| `routers/upload.py` | 上传路由：文件校验、CadQuery 解析、Mock 降级 (含 OBJ 方盒生成) |
+| `routers/cam.py` | CAM 路由：OpenCAMLib 刀路 + 降级策略 + G-Code 输出 |
 | `routers/craftsman.py` | 专家推荐：Min-Max 归一化 + 加权欧氏距离 |
-| `utils/freecad_env.py` | FreeCAD 环境扫描工具 (带缓存) |
-| `scripts/freecad_processor.py` | FreeCAD 无头处理脚本：STEP → 拓扑 + OBJ mesh |
+| `services/geometry_engine.py` | CadQuery STEP 几何解析与 STL 导出 |
+| `services/cam_engine.py` | OpenCAMLib 适配层（Drop-cutter 与兜底策略） |
 
-### 2.3 底层 C++ 几何引擎池 (Isolated Processor)
-* 基于 **FreeCAD 1.1 的无头沙盒架构**。由 Python 后端衍生 `subprocess` 执行。
-* 通过动态扫描定位 `FreeCAD/bin/python.exe` (含 `LOCALAPPDATA`、`Program Files` 搜索) 建立进程隔离，规避 `python311.dll` 跨版本冲突。搜索结果带缓存避免重复扫描。
+### 2.3 底层几何与 CAM 引擎池
+* 几何解析基于 **CadQuery (OpenCASCADE)**，后端进程内直接完成 STEP/B-Rep 读取与特征提取。
+* CAM 规划基于 **OpenCAMLib (C++ Python 绑定)**，优先使用 Drop-cutter 计算刀位点。
+* 当 OpenCAMLib 绑定缺失或符号不匹配时，自动降级到平面粗加工策略，接口契约保持一致。
 * 主要处理：
   * B-Rep STEP 装配体导入解析
   * 面 (Face) 级法向量提取（通过 `ParameterRange` UV 中点获取，兼容平面/圆柱/锥面等所有面类型）
   * 面质心 (CenterOfMass) 计算
   * 包围盒 (BoundBox) 和体积 (Volume) 特征提取
-  * 三角化网格导出 OBJ (精度 0.1mm)
+  * 三角化网格导出 STL (精度 0.1mm)
 
 ---
 
 ## 3. 系统核心流程 (Data Flow)
 
 ### 3.1 上行解析流 (Upload & Preprocess)
-用户前端传入 `.step/.stp` 文件 (≤100 MB) → FastAPI 进行 UUID 封装存档 → 写入 Job 记录 → 通过子进程调用底层 `FreeCAD Engine` (超时 120s) → 取出所有表面的法向量、质心，以及 Bounding Box 极限长宽深 → 导出 OBJ 网格 → 返回带 OBJ 缓存地址的 JSON 拓扑数据。
+用户前端传入 `.step/.stp` 文件 (≤100 MB) → FastAPI 进行 UUID 封装存档 → 写入 Job 记录 → 使用 `CadQuery` 直接解析 STEP/B-Rep → 提取表面法向量、质心、Bounding Box 与体积 → 导出 STL 网格 → 返回带缓存地址的 JSON 拓扑数据。
 
-**Mock 降级**: 当 FreeCAD 不可用时，自动生成基于 bbox 的方盒 OBJ + 6 面拓扑数据，保证前端 3D 预览和交互功能可用。
+**Mock 降级**: 当 CadQuery/OCC 运行时不可用时，自动生成基于 bbox 的方盒 OBJ + 6 面拓扑数据，保证前端 3D 预览和交互功能可用。
 
 ### 3.2 多维特征寻优流 (Craftsman Heuristics / 推荐引擎)
 模型拓扑入库后，`craftsman.py` 接收工件体积 (volume) 和最大深度 (max_depth)。采用 **Min-Max 归一化** 消除量纲差异，配合可配置权重 (volume: 0.6, depth: 0.4) 计算加权欧氏距离，返回最近邻历史案例的工艺参数。无历史数据时返回安全默认值并标记 `is_guessed`。
 
 ### 3.3 下行生成流 (Toolpath & G-Code Generation)
 前端传入用户确认的工艺参数 **+ 模型真实 bbox 尺寸** → `cam.py` 根据实际包围盒生成：
-* **多层 zigzag 粗加工刀路**: 层数 = `ceil(z_depth / step_down)`，行距 = 刀具直径 × 步进比例 (默认 6mm × 40% = 2.4mm)
+* **OpenCAMLib Drop-cutter 刀路**: 对网格表面进行刀位点投影与干涉规避；运行时异常时自动降级为平面粗加工。
 * **分段刀路数据** (含 `G0`/`G1` 类型) 供前端 3D 可视化
 * **GRBL 兼容 G-Code** (.nc 文件) 供 CNC 机床直接消费
 * **加工时间估算**: 基于切削段总长度 / 进给率

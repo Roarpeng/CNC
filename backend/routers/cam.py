@@ -1,11 +1,12 @@
 import os
-import math
+from pathlib import Path
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from typing import Optional
 from sqlalchemy.orm import Session
 from database import get_db
 from models import Job, CAMRecord
+from services.cam_engine import CamInputs, generate_cam_with_ocl, CamEngineError
 
 router = APIRouter()
 
@@ -28,7 +29,7 @@ class GenerateRequest(BaseModel):
 @router.post("/generate/")
 async def generate_toolpath(req: GenerateRequest, db: Session = Depends(get_db)):
     """
-    根据模型实际包围盒生成多层 zigzag 粗加工刀路和对应 G-Code。
+    使用 OpenCAMLib 生成 CAM 刀路；若运行时不可用则自动降级为平面粗加工。
     """
     job = db.query(Job).filter(Job.id == req.job_id).first()
     if not job:
@@ -39,84 +40,70 @@ async def generate_toolpath(req: GenerateRequest, db: Session = Depends(get_db))
         raise HTTPException(status_code=404, detail="Job 目录不存在")
 
     job.status = "generating"
+    job.stage = "cam"
+    job.progress = 35
+    job.error_code = None
+    job.error_message = None
     db.commit()
 
     gcode_path = f"/static/{req.job_id}/output.nc"
-    sd = req.rough_step_down
-    step_over = TOOL_DIAMETER * STEP_OVER_RATIO
     bx, by, bz = req.bbox_x, req.bbox_y, req.z_depth
+    sd = req.rough_step_down
 
-    # 计算层数
-    num_layers = max(1, math.ceil(bz / sd))
-    
-    gcode_lines = [
-        f"(Cloud CAM Generated for Job {req.job_id})",
-        f"(Model: {bx:.1f} x {by:.1f} x {bz:.1f} mm)",
-        f"(Params: step_down={sd} spindle={req.spindle_speed} feed={req.feed_rate})",
-        "G21 (metric)",
-        "G90 (absolute)",
-        f"S{req.spindle_speed} M3",
-        f"G0 Z{SAFE_Z}",
-    ]
-    toolpath_segments = []
+    mesh_candidates = sorted(Path(job_dir).glob("*.stl")) + sorted(Path(job_dir).glob("*.obj"))
+    mesh_path = mesh_candidates[0] if mesh_candidates else None
 
-    prev = [0.0, 0.0, SAFE_Z]
+    if not mesh_path:
+        job.status = "failed"
+        job.stage = "cam"
+        job.progress = 100
+        job.error_code = "E3001"
+        job.error_message = "缺少可用于 CAM 的网格文件 (stl/obj)"
+        db.commit()
+        raise HTTPException(status_code=404, detail="缺少可用于 CAM 的网格文件 (stl/obj)")
 
-    for layer in range(num_layers):
-        z = -min(sd * (layer + 1), bz)
+    try:
+        cam_result = generate_cam_with_ocl(
+            CamInputs(
+                job_id=req.job_id,
+                mesh_path=mesh_path,
+                bbox_x=req.bbox_x,
+                bbox_y=req.bbox_y,
+                z_depth=req.z_depth,
+                step_down=req.rough_step_down,
+                spindle_speed=req.spindle_speed,
+                feed_rate=req.feed_rate,
+                tool_diameter=TOOL_DIAMETER,
+                step_over_ratio=STEP_OVER_RATIO,
+                safe_z=SAFE_Z,
+            )
+        )
+    except CamEngineError as e:
+        job.status = "failed"
+        job.stage = "cam"
+        job.progress = 100
+        job.error_code = "E3001"
+        job.error_message = str(e)
+        db.commit()
+        raise HTTPException(status_code=500, detail=str(e))
 
-        # 快移到本层起点上方
-        toolpath_segments.append({"type": "G0", "from": list(prev), "to": [0, 0, SAFE_Z]})
-        gcode_lines.append(f"G0 X0 Y0 Z{SAFE_Z}")
-        prev = [0.0, 0.0, SAFE_Z]
-
-        # 下刀
-        toolpath_segments.append({"type": "G0", "from": list(prev), "to": [0, 0, z + 1]})
-        gcode_lines.append(f"G0 Z{z + 1:.3f}")
-        prev = [0.0, 0.0, z + 1]
-
-        toolpath_segments.append({"type": "G1", "from": list(prev), "to": [0, 0, z]})
-        gcode_lines.append(f"G1 Z{z:.3f} F{req.feed_rate * 0.5:.0f}")
-        prev = [0.0, 0.0, z]
-
-        # Zigzag 扫描本层
-        y = 0.0
-        forward = True
-        while y <= by:
-            x_start = 0.0 if forward else bx
-            x_end = bx if forward else 0.0
-
-            # 移动到行首
-            if abs(prev[1] - y) > 0.01:
-                toolpath_segments.append({"type": "G1", "from": list(prev), "to": [prev[0], y, z]})
-                gcode_lines.append(f"G1 Y{y:.3f} F{req.feed_rate:.0f}")
-                prev = [prev[0], y, z]
-
-            # 扫描一行
-            toolpath_segments.append({"type": "G1", "from": list(prev), "to": [x_end, y, z]})
-            gcode_lines.append(f"G1 X{x_end:.3f} Y{y:.3f} F{req.feed_rate:.0f}")
-            prev = [x_end, y, z]
-
-            y += step_over
-            forward = not forward
-
-        # 层末抬刀
-        toolpath_segments.append({"type": "G0", "from": list(prev), "to": [prev[0], prev[1], SAFE_Z]})
-        gcode_lines.append(f"G0 Z{SAFE_Z}")
-        prev = [prev[0], prev[1], SAFE_Z]
-
-    # 回原点
-    toolpath_segments.append({"type": "G0", "from": list(prev), "to": [0, 0, SAFE_Z]})
-    gcode_lines.extend(["G0 X0 Y0", f"G0 Z{SAFE_Z}", "M5", "M30"])
+    gcode_lines = cam_result["gcode_lines"]
+    toolpath_segments = cam_result["toolpath_segments"]
 
     try:
         with open(os.path.join(job_dir, "output.nc"), "w") as f:
             f.write("\n".join(gcode_lines) + "\n")
         job.status = "done"
+        job.stage = "completed"
+        job.progress = 100
         job.gcode_url = gcode_path
         db.commit()
     except Exception as e:
         job.status = "failed"
+        job.stage = "cam"
+        job.progress = 100
+        job.error_code = "E5001"
+        job.error_message = str(e)
         db.commit()
         raise HTTPException(status_code=500, detail=f"G-Code 生成失败: {str(e)}")
 
@@ -134,20 +121,10 @@ async def generate_toolpath(req: GenerateRequest, db: Session = Depends(get_db))
     db.add(cam_record)
     db.commit()
 
-    # 估算加工时间 (粗略: 切削总长度 / feed_rate)
-    total_cut_len = sum(
-        math.sqrt(sum((b - a) ** 2 for a, b in zip(s["from"], s["to"])))
-        for s in toolpath_segments if s["type"] == "G1"
-    )
-    est_minutes = round(total_cut_len / req.feed_rate, 1) if req.feed_rate > 0 else 0
-
     return {
         "status": "success",
-        "estimated_time_minutes": est_minutes,
+        "estimated_time_minutes": cam_result["estimated_time_minutes"],
         "gcode_url": gcode_path,
         "toolpath_segments": toolpath_segments,
-        "stats": {
-            "layers": num_layers,
-            "total_cut_length_mm": round(total_cut_len, 1),
-        }
+        "stats": cam_result["stats"],
     }

@@ -1,12 +1,13 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from database import engine
+from database import engine, ensure_jobs_columns
 import models
 from fastapi.staticfiles import StaticFiles
-from routers import upload, craftsman, cam
+from routers import upload, craftsman, cam, jobs
 
 # 自动生成表结构
 models.Base.metadata.create_all(bind=engine)
+ensure_jobs_columns()
 
 app = FastAPI(title="Cloud CAM API", description="Backend routing for STEP processing and CNC generation")
 
@@ -28,6 +29,7 @@ app.mount("/static", StaticFiles(directory="uploads"), name="static")
 app.include_router(upload.router, prefix="/api/v1", tags=["upload"])
 app.include_router(craftsman.router, prefix="/api/v1/craftsman", tags=["expert_system"])
 app.include_router(cam.router, prefix="/api/v1/cam", tags=["cam_generation"])
+app.include_router(jobs.router, prefix="/api/v2/jobs", tags=["jobs_async"])
 
 @app.get("/")
 def read_root():

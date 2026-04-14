@@ -1,14 +1,10 @@
-import os
-import shutil
 import uuid
-import subprocess
-import json
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
 from pathlib import Path
 from sqlalchemy.orm import Session
 from database import get_db
 from models import Job
-from utils.freecad_env import find_freecad_python
+from services.geometry_engine import parse_step_with_cadquery, GeometryEngineError
 
 router = APIRouter()
 
@@ -16,10 +12,6 @@ UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 MAX_FILE_SIZE = 100 * 1024 * 1024  # 100 MB
-SUBPROCESS_TIMEOUT = 120  # seconds
-
-# 假设 backend 运行目录下有 scripts/freecad_processor.py
-PROCESSOR_SCRIPT = Path("scripts/freecad_processor.py").absolute()
 
 @router.post("/upload/")
 async def upload_step_file(file: UploadFile = File(...), db: Session = Depends(get_db)):
@@ -45,37 +37,27 @@ async def upload_step_file(file: UploadFile = File(...), db: Session = Depends(g
         raise HTTPException(status_code=500, detail=f"保存文件失败: {str(e)}")
 
     # 写入 Job 记录
-    job = Job(id=job_id, filename=file.filename, status="uploaded")
+    job = Job(id=job_id, filename=file.filename, status="uploaded", stage="queued", progress=0)
     db.add(job)
     db.commit()
 
     try:
-        freecad_python = find_freecad_python()
+        job.status = "parsing"
+        job.stage = "parsing"
+        job.progress = 10
+        db.commit()
 
-        result = subprocess.run(
-            [freecad_python, str(PROCESSOR_SCRIPT), "--input", str(file_path), "--output_dir", str(output_dir)],
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=SUBPROCESS_TIMEOUT,
-        )
-        
-        # 截取标准输出中最后一行作为 JSON 解析
-        lines = result.stdout.strip().split('\n')
-        json_data = next(line for line in reversed(lines) if line.startswith("{"))
-        topology_data = json.loads(json_data)
-
+        topology_data = parse_step_with_cadquery(str(file_path), str(output_dir))
         job.status = "parsed"
+        job.stage = "meshing"
+        job.progress = 100
+        job.error_code = None
+        job.error_message = None
         db.commit()
-        
-    except subprocess.TimeoutExpired:
-        job.status = "failed"
-        db.commit()
-        raise HTTPException(status_code=504, detail=f"FreeCAD 处理超时 (>{SUBPROCESS_TIMEOUT}s)")
-    except Exception as e:
+    except GeometryEngineError as e:
         # **开发备用/测试模式降级 (Mock Fallback)** 
-        # 当本地未配置 FreeCAD 环境变量时，走此通道保证可以测试前端交互：
-        print(f"[Warning] FreeCAD 执行异常或未找到 (使用 Mock 数据降级处理): {str(e)}")
+        # 当 CadQuery/OCC 运行时缺失或解析失败时，走此通道保证可测试前端交互。
+        print(f"[Warning] CadQuery 执行异常 (使用 Mock 数据降级处理): {str(e)}")
         # 生成 Mock 方盒 OBJ 让前端 3D 预览仍可用
         mock_obj = _generate_mock_box_obj(50.0, 50.0, 20.0)
         mock_obj_path = output_dir / "mock_model.obj"
@@ -93,6 +75,10 @@ async def upload_step_file(file: UploadFile = File(...), db: Session = Depends(g
             "render_file": "mock_model.obj"
         }
         job.status = "parsed_mock"
+        job.stage = "meshing"
+        job.progress = 100
+        job.error_code = "E2001"
+        job.error_message = str(e)
         db.commit()
         
     render_file = topology_data.get("render_file")

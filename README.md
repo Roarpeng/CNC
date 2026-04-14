@@ -11,11 +11,11 @@
 | 功能 | 说明 |
 | :--- | :--- |
 | **STEP 文件上传** | 支持 `.step/.stp` 格式，≤100 MB，自动解析拓扑 |
-| **3D 模型预览** | OBJ 网格渲染，工业光影环境，坐标轴辅助 |
+| **3D 模型预览** | OBJ/STL 网格渲染，工业光影环境，坐标轴辅助 |
 | **交互测量** | 在模型表面点击两点，实时显示距离 (mm) |
 | **装夹面选择** | 点击模型表面指定 CNC 装夹底面，法向可视化 |
 | **专家参数推荐** | 基于加工历史的最近邻匹配，自动推荐工艺参数 |
-| **G-Code 生成** | 基于模型实际尺寸的多层 zigzag 粗加工刀路 |
+| **G-Code 生成** | OpenCAMLib Drop-cutter 刀位计算（不可用时自动降级） |
 | **刀路可视化** | G0 (快移/红色) 和 G1 (切削/青色) 分色 3D 叠加显示 |
 | **G-Code 下载** | 生成 GRBL 兼容 `.nc` 文件，可直接送入 CNC 机床 |
 
@@ -27,7 +27,8 @@
 
 - **Node.js** ≥ 18
 - **Python** ≥ 3.10
-- **FreeCAD 1.1** (可选，用于真实 STEP 解析；缺失时自动 Mock 降级)
+- **CadQuery 2.5+**
+- **OpenCAMLib Python 绑定** (建议安装；缺失时自动降级为平面粗加工)
 
 ### 1. 克隆项目
 
@@ -49,6 +50,13 @@ python -m venv .venv
 cd backend
 pip install -r requirements.txt
 uvicorn main:app --reload --host 0.0.0.0 --port 8000
+
+# 新增：启动异步 worker（另开终端）
+celery -A celery_app.celery_app worker -l info
+
+# 可选：使用 Docker 一键启动 PostgreSQL + Redis + Backend + Worker
+# 在项目根目录执行
+docker compose up --build
 ```
 
 后端运行于 `http://localhost:8000`
@@ -91,14 +99,13 @@ CNC/
 │   ├── database.py                # SQLAlchemy 设置
 │   ├── models.py                  # ORM 模型 (Job, CAMRecord, ToolCard)
 │   ├── requirements.txt           # Python 依赖
+│   ├── services/
+│   │   ├── geometry_engine.py     # CadQuery STEP解析 + STL导出
+│   │   └── cam_engine.py          # OpenCAMLib 刀路生成适配层
 │   ├── routers/
-│   │   ├── upload.py              # 上传 + FreeCAD 解析
-│   │   ├── cam.py                 # G-Code + 刀路生成
+│   │   ├── upload.py              # 上传 + CadQuery 解析
+│   │   ├── cam.py                 # G-Code + OCL/降级刀路生成
 │   │   └── craftsman.py           # 专家推荐引擎
-│   ├── utils/
-│   │   └── freecad_env.py         # FreeCAD 环境扫描
-│   ├── scripts/
-│   │   └── freecad_processor.py   # FreeCAD 无头处理脚本
 │   └── uploads/                   # 运行时文件存储
 ├── frontend/
 │   ├── .env                       # API 地址配置
@@ -122,7 +129,11 @@ CNC/
 | `/api/v1/upload/` | POST | 上传 STEP 文件，返回 3D 模型 URL + 拓扑数据 |
 | `/api/v1/craftsman/recommend/` | GET | 输入体积+深度，返回推荐工艺参数 |
 | `/api/v1/cam/generate/` | POST | 输入参数+模型尺寸，返回 G-Code + 刀路分段 |
-| `/static/{job_id}/{file}` | GET | 获取 OBJ 模型 / G-Code 文件 |
+| `/api/v2/jobs/` | POST | 异步提交 STEP 解析任务，立即返回 `job_id` |
+| `/api/v2/jobs/{job_id}` | GET | 查询异步任务状态与产物 URL |
+| `/api/v2/jobs/{job_id}/cam` | POST | 异步提交 CAM 生成任务 |
+| `/api/v2/jobs/{job_id}/artifacts` | GET | 查询渲染/刀路产物与统计信息 |
+| `/static/{job_id}/{file}` | GET | 获取 GLB/STL/OBJ 模型 / G-Code 文件 |
 
 ---
 
@@ -135,7 +146,8 @@ CNC/
 | **3D 渲染** | Three.js 0.183 + @react-three/fiber + drei |
 | **图标** | lucide-react |
 | **后端框架** | FastAPI + SQLAlchemy + SQLite |
-| **几何引擎** | FreeCAD 1.1 (无头沙箱子进程) |
+| **几何引擎** | CadQuery (OpenCASCADE) |
+| **CAM 引擎** | OpenCAMLib (Drop-cutter) |
 | **G-Code** | GRBL 兼容格式 |
 
 ---
@@ -147,16 +159,11 @@ CNC/
 | 变量 | 位置 | 默认值 | 说明 |
 | :--- | :--- | :--- | :--- |
 | `VITE_API_BASE_URL` | `frontend/.env` | `http://localhost:8000` | 后端 API 地址 |
-| `FREECAD_PATH` | 系统环境变量 | 自动扫描 | FreeCAD bin 目录路径 |
+| `DATABASE_URL` | 系统环境变量 | `sqlite:///./cloudcam.db` | 可切换到 PostgreSQL（推荐生产） |
+| `CELERY_BROKER_URL` | 系统环境变量 | `redis://localhost:6379/0` | Celery Broker |
+| `CELERY_RESULT_BACKEND` | 系统环境变量 | 同 Broker | Celery 结果后端 |
 
-### FreeCAD 自动检测
-
-后端自动在以下路径搜索 FreeCAD：
-- `C:\Program Files\FreeCAD*\*bin`
-- `%LOCALAPPDATA%\Programs\FreeCAD*\*bin`
-- `/usr/lib/freecad/lib` (Linux)
-
-未找到时自动降级为 Mock 模式，生成占位方盒模型。
+OpenCAMLib 绑定不可用时，`/api/v1/cam/generate/` 会自动降级为平面粗加工策略，并在返回 `stats.strategy` 中标记降级原因。
 
 ---
 
