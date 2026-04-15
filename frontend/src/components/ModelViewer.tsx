@@ -1,6 +1,6 @@
 import { Suspense, useMemo, useState, useCallback } from 'react';
 import { Canvas, type ThreeEvent } from '@react-three/fiber';
-import { OrbitControls, Stage, GizmoHelper, GizmoViewport, Html, Line } from '@react-three/drei';
+import { Bounds, Environment, GizmoHelper, GizmoViewport, Html, Line, TrackballControls } from '@react-three/drei';
 import { OBJLoader } from 'three-stdlib';
 import { STLLoader } from 'three-stdlib';
 import { GLTFLoader } from 'three-stdlib';
@@ -32,6 +32,70 @@ export interface ModelViewerProps {
   onFaceSelect?: (face: SelectedFace) => void;
   onMeasure?: (result: MeasureResult) => void;
   selectedFace?: SelectedFace | null;
+}
+
+const WORLD_DOWN = new THREE.Vector3(0, 0, -1);
+
+function toBoxCorners(bounds: THREE.Box3) {
+  return [
+    new THREE.Vector3(bounds.min.x, bounds.min.y, bounds.min.z),
+    new THREE.Vector3(bounds.min.x, bounds.min.y, bounds.max.z),
+    new THREE.Vector3(bounds.min.x, bounds.max.y, bounds.min.z),
+    new THREE.Vector3(bounds.min.x, bounds.max.y, bounds.max.z),
+    new THREE.Vector3(bounds.max.x, bounds.min.y, bounds.min.z),
+    new THREE.Vector3(bounds.max.x, bounds.min.y, bounds.max.z),
+    new THREE.Vector3(bounds.max.x, bounds.max.y, bounds.min.z),
+    new THREE.Vector3(bounds.max.x, bounds.max.y, bounds.max.z),
+  ];
+}
+
+function buildPlacement(bounds: THREE.Box3, selectedFace?: SelectedFace | null) {
+  const rotation = new THREE.Quaternion();
+  if (selectedFace) {
+    rotation.setFromUnitVectors(selectedFace.normal.clone().normalize(), WORLD_DOWN);
+  }
+
+  const rotatedBounds = new THREE.Box3();
+  for (const corner of toBoxCorners(bounds)) {
+    rotatedBounds.expandByPoint(corner.applyQuaternion(rotation));
+  }
+
+  const position = new THREE.Vector3(
+    -(rotatedBounds.min.x + rotatedBounds.max.x) * 0.5,
+    -(rotatedBounds.min.y + rotatedBounds.max.y) * 0.5,
+    -rotatedBounds.min.z,
+  );
+
+  return { rotation, position };
+}
+
+function normalizeToolpathToModelSpace(segments: ToolpathSegment[], bounds: THREE.Box3) {
+  if (segments.length === 0) return segments;
+
+  const isMachineCoordinatePath = segments.some((segment) => segment.from[2] < -1e-6 || segment.to[2] < -1e-6);
+  if (!isMachineCoordinatePath) return segments;
+
+  const toModelPoint = ([x, y, z]: [number, number, number]): [number, number, number] => [
+    bounds.min.x + x,
+    bounds.min.y + y,
+    bounds.max.z + z,
+  ];
+
+  return segments.map((segment) => ({
+    ...segment,
+    from: toModelPoint(segment.from),
+    to: toModelPoint(segment.to),
+  }));
+}
+
+function getObjectBounds(object3d: THREE.Group | THREE.BufferGeometry) {
+  if (object3d instanceof THREE.BufferGeometry) {
+    const geometry = object3d.clone();
+    geometry.computeBoundingBox();
+    return geometry.boundingBox?.clone() ?? new THREE.Box3();
+  }
+
+  return new THREE.Box3().setFromObject(object3d);
 }
 
 /* ===== 加载提示 ===== */
@@ -105,13 +169,16 @@ function PointMarker({ point }: { point: THREE.Vector3 }) {
 
 /* ===== 交互式模型 ===== */
 function InteractiveModel({
-  url, mode, onFaceSelect, onMeasure, setMeasurePoints,
+  url, mode, onFaceSelect, onMeasure, setMeasurePoints, selectedFace, toolpathSegments, showToolpath,
 }: {
   url: string;
   mode: InteractionMode;
   onFaceSelect?: (face: SelectedFace) => void;
   onMeasure?: (result: MeasureResult) => void;
   setMeasurePoints: React.Dispatch<React.SetStateAction<THREE.Vector3[]>>;
+  selectedFace?: SelectedFace | null;
+  toolpathSegments?: ToolpathSegment[];
+  showToolpath: boolean;
 }) {
   const ext = useMemo(() => url.split('?')[0].split('.').pop()?.toLowerCase() ?? 'obj', [url]);
   const loaderClass = useMemo(() => {
@@ -124,6 +191,12 @@ function InteractiveModel({
     if ((loaded as { scene?: THREE.Group }).scene) return (loaded as { scene: THREE.Group }).scene;
     return loaded as THREE.Group | THREE.BufferGeometry;
   }, [loaded]);
+  const objectBounds = useMemo(() => getObjectBounds(object3d), [object3d]);
+  const placement = useMemo(() => buildPlacement(objectBounds, selectedFace), [objectBounds, selectedFace]);
+  const normalizedToolpath = useMemo(
+    () => normalizeToolpathToModelSpace(toolpathSegments ?? [], objectBounds),
+    [toolpathSegments, objectBounds],
+  );
 
   const material = useMemo(() => new THREE.MeshStandardMaterial({
     color: '#94a3b8',
@@ -132,14 +205,19 @@ function InteractiveModel({
     envMapIntensity: 1,
   }), []);
 
-  useMemo(() => {
-    if (object3d instanceof THREE.Group) {
-      object3d.traverse((child) => {
-        if ((child as THREE.Mesh).isMesh) {
-          (child as THREE.Mesh).material = material;
-        }
-      });
-    }
+  const renderObject = useMemo(() => {
+    if (object3d instanceof THREE.BufferGeometry) return null;
+
+    const clone = object3d.clone(true);
+    clone.traverse((child) => {
+      if ((child as THREE.Mesh).isMesh) {
+        const mesh = child as THREE.Mesh;
+        mesh.material = material;
+        mesh.castShadow = true;
+        mesh.receiveShadow = true;
+      }
+    });
+    return clone;
   }, [object3d, material]);
 
   const handleClick = useCallback((e: ThreeEvent<MouseEvent>) => {
@@ -150,15 +228,21 @@ function InteractiveModel({
     if (!hit || !hit.face) return;
 
     if (mode === 'select_face') {
+      const container = e.eventObject;
+      const worldToPlaced = container.matrixWorld.clone().invert();
+      const worldNormalToPlaced = new THREE.Matrix3().getNormalMatrix(worldToPlaced);
+
       const normal = hit.face.normal.clone();
-      // 将法线从局部坐标转换到世界坐标
       if (hit.object instanceof THREE.Mesh) {
         normal.transformDirection(hit.object.matrixWorld);
       }
+
+      normal.applyMatrix3(worldNormalToPlaced).normalize();
+
       const face: SelectedFace = {
         faceIndex: hit.faceIndex ?? 0,
         normal,
-        center: hit.point.clone(),
+        center: hit.point.clone().applyMatrix4(worldToPlaced),
       };
       onFaceSelect?.(face);
     }
@@ -180,13 +264,23 @@ function InteractiveModel({
   }, [mode, onFaceSelect, onMeasure, setMeasurePoints]);
 
   return (
-    <group onClick={handleClick}>
-      {object3d instanceof THREE.BufferGeometry ? (
-        <mesh geometry={object3d} material={material} />
-      ) : (
-        <primitive object={object3d} />
-      )}
-    </group>
+    <Bounds fit clip observe margin={1.2}>
+      <group onClick={handleClick}>
+        <group position={placement.position} quaternion={placement.rotation}>
+          {object3d instanceof THREE.BufferGeometry ? (
+            <mesh geometry={object3d} material={material} castShadow receiveShadow />
+          ) : renderObject ? (
+            <primitive object={renderObject} />
+          ) : null}
+
+          {selectedFace && <FaceHighlight face={selectedFace} />}
+
+          {normalizedToolpath.length > 0 && (
+            <ToolpathViewer segments={normalizedToolpath} visible={showToolpath} />
+          )}
+        </group>
+      </group>
+    </Bounds>
   );
 }
 
@@ -200,32 +294,28 @@ export default function ModelViewer({
   return (
     <Canvas shadows camera={{ position: [50, 50, 50], fov: 45 }}>
       <color attach="background" args={['#0f172a']} />
+      <ambientLight intensity={0.7} />
+      <directionalLight position={[80, 120, 60]} intensity={1.2} castShadow />
+      <Environment preset="city" />
 
       <Suspense fallback={<LoadingSpinner />}>
-        <Stage preset="soft" environment="city" intensity={0.8} adjustCamera>
-          <InteractiveModel
-            url={renderUrl}
-            mode={mode}
-            onFaceSelect={onFaceSelect}
-            onMeasure={onMeasure}
-            setMeasurePoints={setMeasurePoints}
-          />
-        </Stage>
-
-        {/* 装夹面高亮 */}
-        {selectedFace && <FaceHighlight face={selectedFace} />}
+        <InteractiveModel
+          url={renderUrl}
+          mode={mode}
+          onFaceSelect={onFaceSelect}
+          onMeasure={onMeasure}
+          setMeasurePoints={setMeasurePoints}
+          selectedFace={selectedFace}
+          toolpathSegments={toolpathSegments}
+          showToolpath={showToolpath}
+        />
 
         {/* 测量辅助 */}
         {measurePoints.length === 1 && <PointMarker point={measurePoints[0]} />}
         {measurePoints.length === 2 && <MeasureLine p1={measurePoints[0]} p2={measurePoints[1]} />}
-
-        {/* 刀路叠加显示 */}
-        {toolpathSegments && toolpathSegments.length > 0 && (
-          <ToolpathViewer segments={toolpathSegments} visible={showToolpath} />
-        )}
       </Suspense>
 
-      <OrbitControls makeDefault minPolarAngle={0} maxPolarAngle={Math.PI} />
+      <TrackballControls makeDefault noPan={mode !== 'orbit'} />
 
       <GizmoHelper alignment="bottom-right" margin={[80, 80]}>
         <GizmoViewport labelColor="white" axisHeadScale={1} />

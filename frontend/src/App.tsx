@@ -228,6 +228,11 @@ function App() {
         bbox_y: f?.bbox_y ?? 50,
         z_depth: f?.z_depth ?? 20,
         volume: f?.volume,
+        selected_face: selectedFace ? {
+          face_index: selectedFace.faceIndex,
+          normal: { x: selectedFace.normal.x, y: selectedFace.normal.y, z: selectedFace.normal.z },
+          center: { x: selectedFace.center.x, y: selectedFace.center.y, z: selectedFace.center.z },
+        } : null,
       });
       setGcodeResult(res.data);
       // 解析刀路分段数据

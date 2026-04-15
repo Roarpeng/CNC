@@ -5,6 +5,7 @@
 ## 0. 关联文档
 
 - SaaS 工业化改造 RFC: [rfc-saas-industrialization.md](rfc-saas-industrialization.md)
+- 4 人协作开发方案: [team-collaboration-plan.md](team-collaboration-plan.md)
 
 ## 1. 项目愿景与定位
 本项目定位于"**内部使用型 Web CAM 平台**"，面向车间和制造团队的内部工作流。允许操作人员通过浏览器直接完成模型上传、解析、刀路预览、G-Code 生成和下载的完整闭环，无需安装重型 CAM 软件。同时提供作业历史查询、参数推荐和回看能力，不追求大型 SaaS 复杂度，优先保证**上传 → 解析 → 预览 → 生成 → 下载** 单一主链路稳定可用。

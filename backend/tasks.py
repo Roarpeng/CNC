@@ -107,6 +107,7 @@ def generate_cam_task(self, job_id: str, cam_req: dict) -> dict:
                     step_down=cam_req["rough_step_down"],
                     spindle_speed=cam_req["spindle_speed"],
                     feed_rate=cam_req["feed_rate"],
+                    setup_normal=tuple(cam_req["selected_face"]["normal"][key] for key in ("x", "y", "z")) if cam_req.get("selected_face") else None,
                 )
             )
         except CamEngineError as exc:

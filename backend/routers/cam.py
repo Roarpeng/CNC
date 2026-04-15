@@ -20,6 +20,16 @@ def _write_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
 class GenerateRequest(BaseModel):
+    class FaceVector(BaseModel):
+        x: float
+        y: float
+        z: float
+
+    class SelectedFacePayload(BaseModel):
+        face_index: int
+        normal: FaceVector
+        center: FaceVector
+
     job_id: str
     rough_tool_id: int
     rough_step_down: float
@@ -30,6 +40,7 @@ class GenerateRequest(BaseModel):
     bbox_y: float
     z_depth: float
     volume: Optional[float] = None
+    selected_face: Optional[SelectedFacePayload] = None
 
 @router.post("/generate/")
 async def generate_toolpath(req: GenerateRequest, db: Session = Depends(get_db)):
@@ -81,6 +92,11 @@ async def generate_toolpath(req: GenerateRequest, db: Session = Depends(get_db))
                 tool_diameter=TOOL_DIAMETER,
                 step_over_ratio=STEP_OVER_RATIO,
                 safe_z=SAFE_Z,
+                setup_normal=(
+                    req.selected_face.normal.x,
+                    req.selected_face.normal.y,
+                    req.selected_face.normal.z,
+                ) if req.selected_face else None,
             )
         )
     except CamEngineError as e:
