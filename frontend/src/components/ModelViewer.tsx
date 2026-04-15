@@ -1,6 +1,6 @@
 import { Suspense, useMemo, useState, useCallback } from 'react';
 import { Canvas, type ThreeEvent } from '@react-three/fiber';
-import { OrbitControls, Stage, GizmoHelper, GizmoViewport, Html, Line } from '@react-three/drei';
+import { ArcballControls, GizmoHelper, GizmoViewport, Html, Line, Stage } from '@react-three/drei';
 import { OBJLoader } from 'three-stdlib';
 import { STLLoader } from 'three-stdlib';
 import { GLTFLoader } from 'three-stdlib';
@@ -23,10 +23,21 @@ export interface MeasureResult {
   distance: number;
 }
 
+export interface ModelTransform {
+  position: [number, number, number];
+  quaternion: [number, number, number, number];
+}
+
+const IDENTITY_TRANSFORM: ModelTransform = {
+  position: [0, 0, 0],
+  quaternion: [0, 0, 0, 1],
+};
+
 export interface ModelViewerProps {
   renderUrl: string;
   topology: any;
   mode: InteractionMode;
+  modelTransform?: ModelTransform;
   toolpathSegments?: ToolpathSegment[];
   showToolpath?: boolean;
   onFaceSelect?: (face: SelectedFace) => void;
@@ -192,24 +203,38 @@ function InteractiveModel({
 
 /* ===== 主组件 ===== */
 export default function ModelViewer({
-  renderUrl, mode, toolpathSegments, showToolpath = true,
+  renderUrl, mode, modelTransform = IDENTITY_TRANSFORM, toolpathSegments, showToolpath = true,
   onFaceSelect, onMeasure, selectedFace,
 }: ModelViewerProps) {
   const [measurePoints, setMeasurePoints] = useState<THREE.Vector3[]>([]);
+  const position = useMemo(
+    () => new THREE.Vector3(...modelTransform.position),
+    [modelTransform],
+  );
+  const quaternion = useMemo(
+    () => new THREE.Quaternion(...modelTransform.quaternion),
+    [modelTransform],
+  );
 
   return (
-    <Canvas shadows camera={{ position: [50, 50, 50], fov: 45 }}>
+    <Canvas shadows camera={{ position: [50, 50, 50], fov: 45, up: [0, 0, 1] }}>
       <color attach="background" args={['#0f172a']} />
 
       <Suspense fallback={<LoadingSpinner />}>
         <Stage preset="soft" environment="city" intensity={0.8} adjustCamera>
-          <InteractiveModel
-            url={renderUrl}
-            mode={mode}
-            onFaceSelect={onFaceSelect}
-            onMeasure={onMeasure}
-            setMeasurePoints={setMeasurePoints}
-          />
+          <group position={position} quaternion={quaternion}>
+            <InteractiveModel
+              url={renderUrl}
+              mode={mode}
+              onFaceSelect={onFaceSelect}
+              onMeasure={onMeasure}
+              setMeasurePoints={setMeasurePoints}
+            />
+            {/* 刀路与模型应用同一变换 + 同一 Stage，避免显示偏移 */}
+            {toolpathSegments && toolpathSegments.length > 0 && (
+              <ToolpathViewer segments={toolpathSegments} visible={showToolpath} />
+            )}
+          </group>
         </Stage>
 
         {/* 装夹面高亮 */}
@@ -218,14 +243,10 @@ export default function ModelViewer({
         {/* 测量辅助 */}
         {measurePoints.length === 1 && <PointMarker point={measurePoints[0]} />}
         {measurePoints.length === 2 && <MeasureLine p1={measurePoints[0]} p2={measurePoints[1]} />}
-
-        {/* 刀路叠加显示 */}
-        {toolpathSegments && toolpathSegments.length > 0 && (
-          <ToolpathViewer segments={toolpathSegments} visible={showToolpath} />
-        )}
       </Suspense>
 
-      <OrbitControls makeDefault minPolarAngle={0} maxPolarAngle={Math.PI} />
+      {/* Arcball 支持完整翻滚，避免 Orbit 的 180° 俯仰限制 */}
+      <ArcballControls makeDefault enabled={mode === 'orbit'} />
 
       <GizmoHelper alignment="bottom-right" margin={[80, 80]}>
         <GizmoViewport labelColor="white" axisHeadScale={1} />
