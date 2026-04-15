@@ -1,5 +1,6 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import axios from 'axios';
+import * as THREE from 'three';
 import { UploadCloud, Settings, Play, Download, AlertTriangle, Box, Ruler, Layers, CheckCircle2, Loader2, Move3d, Crosshair, Eye, EyeOff, RotateCw, FolderClock } from 'lucide-react';
 import type { InteractionMode, SelectedFace, MeasureResult } from './components/ModelViewer';
 import type { ToolpathSegment } from './components/ToolpathViewer';
@@ -10,6 +11,16 @@ import './App.css';
 const API = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
 
 type Status = 'idle' | 'uploading' | 'uploaded' | 'generating' | 'done' | 'error';
+
+type ModelTransform = {
+  position: [number, number, number];
+  quaternion: [number, number, number, number];
+};
+
+const IDENTITY_MODEL_TRANSFORM: ModelTransform = {
+  position: [0, 0, 0],
+  quaternion: [0, 0, 0, 1],
+};
 
 type JobSnapshot = {
   job_id: string;
@@ -88,6 +99,7 @@ function App() {
   const [measureResult, setMeasureResult] = useState<MeasureResult | null>(null);
   const [showToolpath, setShowToolpath] = useState(true);
   const [toolpathSegments, setToolpathSegments] = useState<ToolpathSegment[]>([]);
+  const [modelTransform, setModelTransform] = useState<ModelTransform>(IDENTITY_MODEL_TRANSFORM);
 
   // 可编辑的工艺参数 (由专家推荐初始化，用户可覆写)
   const [editParams, setEditParams] = useState({
@@ -127,6 +139,7 @@ function App() {
     setToolpathSegments(restoredCam?.toolpath_segments ?? []);
     setSelectedFace(null);
     setMeasureResult(null);
+    setModelTransform(IDENTITY_MODEL_TRANSFORM);
   };
 
   const loadRecentJobs = async () => {
@@ -176,6 +189,9 @@ function App() {
     setModelData(null);
     setCurrentJob(null);
     setToolpathSegments([]);
+    setSelectedFace(null);
+    setMeasureResult(null);
+    setModelTransform(IDENTITY_MODEL_TRANSFORM);
 
     const formData = new FormData();
     formData.append('file', selectedFile);
@@ -262,6 +278,42 @@ function App() {
 
   const features = modelData?.topology?.features;
   const currentProgress = currentJob?.progress ?? (status === 'done' ? 100 : status === 'uploaded' ? 100 : 0);
+
+  const handleFaceSelect = useCallback((face: SelectedFace) => {
+    const targetDown = new THREE.Vector3(0, 0, -1);
+    const faceNormal = face.normal.clone().normalize();
+    const deltaRotation = new THREE.Quaternion().setFromUnitVectors(faceNormal, targetDown);
+
+    // 让选中的底面点落到 Z=0 平面，保持 X/Y 位置不突变。
+    const rotatedCenter = face.center.clone().applyQuaternion(deltaRotation);
+    const deltaPosition = new THREE.Vector3(0, 0, -rotatedCenter.z);
+
+    const prevQuaternion = new THREE.Quaternion(
+      modelTransform.quaternion[0],
+      modelTransform.quaternion[1],
+      modelTransform.quaternion[2],
+      modelTransform.quaternion[3],
+    );
+    const prevPosition = new THREE.Vector3(
+      modelTransform.position[0],
+      modelTransform.position[1],
+      modelTransform.position[2],
+    );
+
+    const nextQuaternion = deltaRotation.clone().multiply(prevQuaternion);
+    const nextPosition = prevPosition.clone().applyQuaternion(deltaRotation).add(deltaPosition);
+
+    setModelTransform({
+      quaternion: [nextQuaternion.x, nextQuaternion.y, nextQuaternion.z, nextQuaternion.w],
+      position: [nextPosition.x, nextPosition.y, nextPosition.z],
+    });
+    setSelectedFace({
+      faceIndex: face.faceIndex,
+      normal: face.normal.clone().applyQuaternion(deltaRotation).normalize(),
+      center: face.center.clone().applyQuaternion(deltaRotation).add(deltaPosition),
+    });
+    setViewMode('orbit');
+  }, [modelTransform]);
 
   return (
     <div className="flex h-screen w-screen text-slate-200">
@@ -554,8 +606,9 @@ function App() {
               renderUrl={`${API}${modelData.render_url}`}
               topology={modelData.topology}
               mode={viewMode}
+              modelTransform={modelTransform}
               selectedFace={selectedFace}
-              onFaceSelect={setSelectedFace}
+              onFaceSelect={handleFaceSelect}
               onMeasure={setMeasureResult}
               toolpathSegments={toolpathSegments}
               showToolpath={showToolpath}

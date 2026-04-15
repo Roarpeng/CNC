@@ -30,6 +30,16 @@ class CamInputs:
     safe_z: float = SAFE_Z_DEFAULT
 
 
+@dataclass
+class WorkEnvelope:
+    x_min: float
+    x_max: float
+    y_min: float
+    y_max: float
+    z_min: float
+    z_max: float
+
+
 def generate_cam_with_ocl(inputs: CamInputs) -> dict[str, Any]:
     """
     Preferred pipeline: OpenCAMLib drop-cutter.
@@ -69,6 +79,8 @@ def _generate_dropcutter_toolpath(inputs: CamInputs) -> dict[str, Any]:
             return _generate_planar_fallback(inputs, strategy="fallback_ocl_symbols_missing")
 
         mesh = trimesh.load_mesh(str(inputs.mesh_path), force="mesh")
+        envelope = _resolve_work_envelope(mesh, inputs)
+        safe_z_abs = envelope.z_max + abs(inputs.safe_z)
         surf = ocl.STLSurf()
 
         for tri in mesh.triangles:
@@ -92,13 +104,13 @@ def _generate_dropcutter_toolpath(inputs: CamInputs) -> dict[str, Any]:
         drop.setCutter(cutter)
 
         step_over = max(inputs.tool_diameter * inputs.step_over_ratio, 0.1)
-        y = 0.0
+        y = envelope.y_min
         forward = True
-        while y <= inputs.bbox_y + 1e-6:
-            x_from = 0.0 if forward else inputs.bbox_x
-            x_to = inputs.bbox_x if forward else 0.0
-            drop.appendPoint(ocl.CLPoint(float(x_from), float(y), float(inputs.safe_z)))
-            drop.appendPoint(ocl.CLPoint(float(x_to), float(y), float(inputs.safe_z)))
+        while y <= envelope.y_max + 1e-6:
+            x_from = envelope.x_min if forward else envelope.x_max
+            x_to = envelope.x_max if forward else envelope.x_min
+            drop.appendPoint(ocl.CLPoint(float(x_from), float(y), float(safe_z_abs)))
+            drop.appendPoint(ocl.CLPoint(float(x_to), float(y), float(safe_z_abs)))
             y += step_over
             forward = not forward
 
@@ -109,24 +121,24 @@ def _generate_dropcutter_toolpath(inputs: CamInputs) -> dict[str, Any]:
 
         gcode_lines = [
             f"(Cloud CAM OCL Generated for Job {inputs.job_id})",
-            f"(Model: {inputs.bbox_x:.1f} x {inputs.bbox_y:.1f} x {inputs.z_depth:.1f} mm)",
+            f"(Model: {envelope.x_max - envelope.x_min:.1f} x {envelope.y_max - envelope.y_min:.1f} x {envelope.z_max - envelope.z_min:.1f} mm)",
             f"(Params: step_down={inputs.step_down} spindle={inputs.spindle_speed} feed={inputs.feed_rate})",
             "(Strategy: OpenCAMLib Drop-Cutter)",
             "G21 (metric)",
             "G90 (absolute)",
             f"S{inputs.spindle_speed} M3",
-            f"G0 Z{inputs.safe_z}",
+            f"G0 Z{safe_z_abs:.3f}",
         ]
 
         toolpath_segments: list[dict[str, Any]] = []
-        prev = [0.0, 0.0, inputs.safe_z]
+        prev = [envelope.x_min, envelope.y_min, safe_z_abs]
 
         first = cl_points[0]
         first_p = [float(first.x), float(first.y), float(first.z)]
-        toolpath_segments.append({"type": "G0", "from": list(prev), "to": [first_p[0], first_p[1], inputs.safe_z]})
-        gcode_lines.append(f"G0 X{first_p[0]:.3f} Y{first_p[1]:.3f} Z{inputs.safe_z:.3f}")
+        toolpath_segments.append({"type": "G0", "from": list(prev), "to": [first_p[0], first_p[1], safe_z_abs]})
+        gcode_lines.append(f"G0 X{first_p[0]:.3f} Y{first_p[1]:.3f} Z{safe_z_abs:.3f}")
 
-        toolpath_segments.append({"type": "G1", "from": [first_p[0], first_p[1], inputs.safe_z], "to": first_p})
+        toolpath_segments.append({"type": "G1", "from": [first_p[0], first_p[1], safe_z_abs], "to": first_p})
         gcode_lines.append(f"G1 Z{first_p[2]:.3f} F{inputs.feed_rate * 0.5:.0f}")
         prev = list(first_p)
 
@@ -136,9 +148,9 @@ def _generate_dropcutter_toolpath(inputs: CamInputs) -> dict[str, Any]:
             gcode_lines.append(f"G1 X{nxt[0]:.3f} Y{nxt[1]:.3f} Z{nxt[2]:.3f} F{inputs.feed_rate:.0f}")
             prev = nxt
 
-        toolpath_segments.append({"type": "G0", "from": list(prev), "to": [prev[0], prev[1], inputs.safe_z]})
-        gcode_lines.append(f"G0 Z{inputs.safe_z:.3f}")
-        gcode_lines.extend(["G0 X0 Y0", "M5", "M30"])
+        toolpath_segments.append({"type": "G0", "from": list(prev), "to": [prev[0], prev[1], safe_z_abs]})
+        gcode_lines.append(f"G0 Z{safe_z_abs:.3f}")
+        gcode_lines.extend([f"G0 X{envelope.x_min:.3f} Y{envelope.y_min:.3f}", "M5", "M30"])
 
         total_cut_len = _cutting_length(toolpath_segments)
 
@@ -158,42 +170,48 @@ def _generate_dropcutter_toolpath(inputs: CamInputs) -> dict[str, Any]:
 
 def _generate_planar_fallback(inputs: CamInputs, strategy: str) -> dict[str, Any]:
     """Compatibility fallback that preserves the existing API contract."""
+    mesh = trimesh.load_mesh(str(inputs.mesh_path), force="mesh")
+    envelope = _resolve_work_envelope(mesh, inputs)
+
     step_over = max(inputs.tool_diameter * inputs.step_over_ratio, 0.1)
-    num_layers = max(1, math.ceil(inputs.z_depth / max(inputs.step_down, 0.1)))
+    z_span = max(envelope.z_max - envelope.z_min, 0.1)
+    num_layers = max(1, math.ceil(z_span / max(inputs.step_down, 0.1)))
+    safe_z_abs = envelope.z_max + abs(inputs.safe_z)
 
     gcode_lines = [
         f"(Cloud CAM Generated for Job {inputs.job_id})",
-        f"(Model: {inputs.bbox_x:.1f} x {inputs.bbox_y:.1f} x {inputs.z_depth:.1f} mm)",
+        f"(Model: {envelope.x_max - envelope.x_min:.1f} x {envelope.y_max - envelope.y_min:.1f} x {envelope.z_max - envelope.z_min:.1f} mm)",
         f"(Params: step_down={inputs.step_down} spindle={inputs.spindle_speed} feed={inputs.feed_rate})",
         f"(Strategy: {strategy})",
         "G21 (metric)",
         "G90 (absolute)",
         f"S{inputs.spindle_speed} M3",
-        f"G0 Z{inputs.safe_z}",
+        f"G0 Z{safe_z_abs:.3f}",
     ]
 
     toolpath_segments: list[dict[str, Any]] = []
-    prev = [0.0, 0.0, inputs.safe_z]
+    prev = [envelope.x_min, envelope.y_min, safe_z_abs]
 
     for layer in range(num_layers):
-        z = -min(inputs.step_down * (layer + 1), inputs.z_depth)
+        z = max(envelope.z_max - inputs.step_down * (layer + 1), envelope.z_min)
+        plunge_start = min(z + 1.0, safe_z_abs)
 
-        toolpath_segments.append({"type": "G0", "from": list(prev), "to": [0.0, 0.0, inputs.safe_z]})
-        gcode_lines.append(f"G0 X0 Y0 Z{inputs.safe_z:.3f}")
-        prev = [0.0, 0.0, inputs.safe_z]
+        toolpath_segments.append({"type": "G0", "from": list(prev), "to": [envelope.x_min, envelope.y_min, safe_z_abs]})
+        gcode_lines.append(f"G0 X{envelope.x_min:.3f} Y{envelope.y_min:.3f} Z{safe_z_abs:.3f}")
+        prev = [envelope.x_min, envelope.y_min, safe_z_abs]
 
-        toolpath_segments.append({"type": "G0", "from": list(prev), "to": [0.0, 0.0, z + 1.0]})
-        gcode_lines.append(f"G0 Z{z + 1.0:.3f}")
-        prev = [0.0, 0.0, z + 1.0]
+        toolpath_segments.append({"type": "G0", "from": list(prev), "to": [envelope.x_min, envelope.y_min, plunge_start]})
+        gcode_lines.append(f"G0 Z{plunge_start:.3f}")
+        prev = [envelope.x_min, envelope.y_min, plunge_start]
 
-        toolpath_segments.append({"type": "G1", "from": list(prev), "to": [0.0, 0.0, z]})
+        toolpath_segments.append({"type": "G1", "from": list(prev), "to": [envelope.x_min, envelope.y_min, z]})
         gcode_lines.append(f"G1 Z{z:.3f} F{inputs.feed_rate * 0.5:.0f}")
-        prev = [0.0, 0.0, z]
+        prev = [envelope.x_min, envelope.y_min, z]
 
-        y = 0.0
+        y = envelope.y_min
         forward = True
-        while y <= inputs.bbox_y + 1e-6:
-            x_end = inputs.bbox_x if forward else 0.0
+        while y <= envelope.y_max + 1e-6:
+            x_end = envelope.x_max if forward else envelope.x_min
 
             if abs(prev[1] - y) > 0.01:
                 toolpath_segments.append({"type": "G1", "from": list(prev), "to": [prev[0], y, z]})
@@ -207,12 +225,12 @@ def _generate_planar_fallback(inputs: CamInputs, strategy: str) -> dict[str, Any
             y += step_over
             forward = not forward
 
-        toolpath_segments.append({"type": "G0", "from": list(prev), "to": [prev[0], prev[1], inputs.safe_z]})
-        gcode_lines.append(f"G0 Z{inputs.safe_z:.3f}")
-        prev = [prev[0], prev[1], inputs.safe_z]
+        toolpath_segments.append({"type": "G0", "from": list(prev), "to": [prev[0], prev[1], safe_z_abs]})
+        gcode_lines.append(f"G0 Z{safe_z_abs:.3f}")
+        prev = [prev[0], prev[1], safe_z_abs]
 
-    toolpath_segments.append({"type": "G0", "from": list(prev), "to": [0.0, 0.0, inputs.safe_z]})
-    gcode_lines.extend(["G0 X0 Y0", "M5", "M30"])
+    toolpath_segments.append({"type": "G0", "from": list(prev), "to": [envelope.x_min, envelope.y_min, safe_z_abs]})
+    gcode_lines.extend([f"G0 X{envelope.x_min:.3f} Y{envelope.y_min:.3f}", "M5", "M30"])
 
     total_cut_len = _cutting_length(toolpath_segments)
 
@@ -233,4 +251,35 @@ def _cutting_length(toolpath_segments: list[dict[str, Any]]) -> float:
         math.sqrt(sum((b - a) ** 2 for a, b in zip(seg["from"], seg["to"])))
         for seg in toolpath_segments
         if seg["type"] == "G1"
+    )
+
+
+def _resolve_work_envelope(mesh: trimesh.Trimesh, inputs: CamInputs) -> WorkEnvelope:
+    try:
+        bounds = mesh.bounds
+        if bounds is not None and len(bounds) == 2:
+            mins = bounds[0]
+            maxs = bounds[1]
+            x_min, x_max = sorted((float(mins[0]), float(maxs[0])))
+            y_min, y_max = sorted((float(mins[1]), float(maxs[1])))
+            z_min, z_max = sorted((float(mins[2]), float(maxs[2])))
+            if (x_max - x_min) > 1e-6 and (y_max - y_min) > 1e-6 and (z_max - z_min) > 1e-6:
+                return WorkEnvelope(
+                    x_min=x_min,
+                    x_max=x_max,
+                    y_min=y_min,
+                    y_max=y_max,
+                    z_min=z_min,
+                    z_max=z_max,
+                )
+    except Exception:
+        pass
+
+    return WorkEnvelope(
+        x_min=0.0,
+        x_max=max(inputs.bbox_x, 0.1),
+        y_min=0.0,
+        y_max=max(inputs.bbox_y, 0.1),
+        z_min=0.0,
+        z_max=max(inputs.z_depth, 0.1),
     )
