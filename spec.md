@@ -1,6 +1,6 @@
 # Cloud CAM 工业级云端加工管理平台系统规范 (Spec)
 
-> **最后更新**: 2026-04-16 (v2 — 装夹面高亮/刀路坐标修正)
+> **最后更新**: 2026-04-16 (v4 — CAM 底面穿透修复)
 
 ## 1. 项目愿景与定位
 本项目定位于"**内部使用型 Web CAM 平台**"，面向车间和制造团队的内部工作流。允许操作人员通过浏览器直接完成模型上传、解析、刀路预览、G-Code 生成和下载的完整闭环，无需安装重型 CAM 软件。同时提供作业历史查询、参数推荐和回看能力，不追求大型 SaaS 复杂度，优先保证**上传 → 解析 → 预览 → 生成 → 下载** 单一主链路稳定可用。
@@ -13,8 +13,9 @@
 ### 2.1 交互表现层 (Frontend)
 * **主框架**: `React 19` + `Vite 8` 构建的超速轻量化前端。
 * **语言规范**: `TypeScript 6` + 严格检查 (`verbatimModuleSyntax`)。
-* **样式引擎**: `TailwindCSS v4` (通过 `@tailwindcss/vite` 插件集成)，以暗色系 (`Slate-900`) 为主的现代工业质感 UI。
-* **3D 驱动渲染**: 围绕 `Three.js 0.183` 生态群（`@react-three/fiber 9` 声明式引擎 与 `@react-three/drei 10` 特效库），完成了 OBJ/STL 网格模型载入和工业化影棚 (`<Stage>`) 渲染展示。
+* **样式引擎**: `TailwindCSS v4` (通过 `@tailwindcss/vite` 插件集成)，以深色工业质感 (`#0c1222`) 为基底，`backdrop-blur` 毛玻璃卡片 + 渐变色品牌元素的现代 UI。
+* **前端架构**: 模块化组件体系 — 共享类型层 (`types.ts`)、UI 原子组件 (`ui/`)、业务侧边栏组件 (`sidebar/`)、3D 组件层，`App.tsx` 仅承担状态编排与 API 调用。
+* **3D 驱动渲染**: 围绕 `Three.js 0.183` 生态群（`@react-three/fiber 9` 声明式引擎 与 `@react-three/drei 10` 特效库），完成了 OBJ/STL/GLB 网格模型载入和 Environment 环境光渲染。
 * **图标体系**: `lucide-react` 提供统一的线条图标。
 * **HTTP 客户端**: `axios`，通过环境变量 `VITE_API_BASE_URL` 配置 API 地址。
 
@@ -26,6 +27,7 @@
 * **刀路可视化叠加**: 生成 G-Code 后，3D 场景自动叠加显示刀路，刀路坐标经后端逆变换回模型原始坐标系，与模型精确对齐：
   * 红色线段 = G0 快速移动（非切削）
   * 青色线段 = G1 切削进给
+  * 橙色线段 = G2/G3 圆弧插补（孔螺旋铣削、型腔轮廓）
   * 绿色球 = 起点，红色球 = 终点
   * 支持显示/隐藏切换
   * 底部图例条标注颜色含义
@@ -33,24 +35,39 @@
 * **错误容错**: `ErrorBoundary` 组件包裹 3D 渲染区，防止 WebGL 崩溃影响整个应用。
 
 #### 2.1.2 侧边栏 UI
-* **上传区**: 拖拽/点击上传 `.step/.stp` 文件，前端限制 100 MB，带状态动画。
-* **当前作业概览** (新增): 显示当前作业文件名、状态（已上传/解析中/生成中/已完成/失败）、进度条、错误提示；支持 Mock 降级状态标注。
-* **最近作业列表** (新增): 显示最近 8 个作业历史，支持点击恢复任意历史作业，显示阶段、进度、错误信息，带刷新按钮。
-* **模型特征卡片**: 显示体积、XY 尺寸、最大 Z 深度。
-* **加工特征识别卡片**: 显示识别到的制造特征（孔、型腔、凸台）及其参数（直径/深度/范围），支持特征类型汇总统计。
-* **工艺参数面板**: 显示专家推荐参数（背吃刀量、主轴转速、进给率），**用户可编辑覆写**。标注"专家推荐"或"默认值"来源。
-* **刀具选配方案卡片**: 显示自动选配的粗加工刀具和各特征对应的精加工刀具，含选刀理由。
-* **G-Code 结果卡片**: 显示预计加工时间、加工层数、切削总长度，提供 `.nc` 文件下载。
-* **生成按钮**: 底部固定，带加载状态和禁用逻辑。
+侧边栏采用 **统一卡片化布局**，每个功能区域独立为 `SectionCard` 组件（图标 + 标题 + 可选徽章 + 内容），视觉一致且可独立复用。从上到下依次为：
+
+* **上传区** (`UploadArea`): 拖拽/点击上传 `.step/.stp` 文件，前端限制 100 MB，带状态色彩反馈和上传动画。
+* **当前作业概览** (`CurrentJobCard`): 显示当前作业文件名、`StatusBadge` 状态徽章（已上传/解析中/生成中/已完成/失败）、四格元信息（阶段/进度/ID/时间）、进度条；支持 Mock 降级状态标注。
+* **加工特征识别** (`ManufacturingFeatures`): 带"专家推荐" `ExpertBadge`，显示特征类型汇总标签（孔 ×3、型腔 ×2）和每个特征的详细参数（直径/深度/范围）。
+* **模型特征** (`ModelFeatures`): 显示体积、XY 尺寸、最大 Z 深度，带图标和 mono 数值。
+* **工艺参数** (`ProcessParams`): 带 `ExpertBadge`（区分"专家推荐"/"默认值"），背吃刀量/主轴转速/进给率三行可编辑输入，用户可覆写推荐值。
+* **刀具选配方案** (`ToolPlanCard`): 粗加工刀具高亮卡 + 特征精加工刀具列表，含选刀理由。
+* **G-Code 结果** (`GCodeResult`): 绿色主题卡片，显示预计加工时间，提供 `.nc` 文件下载按钮。
+* **最近作业** (`RecentJobs`): 显示最近 8 个作业历史，支持点击恢复任意历史作业，带刷新按钮和内嵌进度条。
+* **生成按钮**: 底部固定，渐变色 + 阴影，带加载旋转和禁用逻辑。
 
 #### 2.1.3 前端关键文件
 | 文件路径 | 职责 |
 | :--- | :--- |
-| `src/App.tsx` | 主应用：状态管理、上传/生成流程、侧边栏 UI、工具栏、**作业列表与恢复** (新增) |
-| `src/components/ModelViewer.tsx` | 3D 模型渲染：OBJ/STL/GLB 加载、**共面洪泛面高亮**、测量、刀路叠加（模型坐标系直接渲染） |
-| `src/components/ToolpathViewer.tsx` | 刀路 3D 可视化：G0/G1 分色线段、起止标记；已修正 bufferAttribute 类型 |
+| `src/types.ts` | 共享类型定义 (`JobSnapshot`/`ToolPlan`/`EditableParams` 等) + 状态映射/格式化函数 |
+| `src/App.tsx` | 主编排器：状态管理、API 调用、布局组合（~170 行，原 ~800 行） |
+| `src/App.css` | 自定义滚动条 + 数字输入样式 |
+| `src/components/ui/SectionCard.tsx` | 通用卡片原子组件：图标 + 标题 + 徽章 + 内容插槽 |
+| `src/components/ui/StatusBadge.tsx` | 作业状态徽章（颜色按状态自动映射） |
+| `src/components/ui/ExpertBadge.tsx` | "专家推荐"/"默认值"标签 |
+| `src/components/sidebar/UploadArea.tsx` | 文件上传区域 |
+| `src/components/sidebar/CurrentJobCard.tsx` | 当前作业概览卡片 |
+| `src/components/sidebar/ManufacturingFeatures.tsx` | 加工特征识别卡片 |
+| `src/components/sidebar/ModelFeatures.tsx` | 模型特征（体积/尺寸/深度）卡片 |
+| `src/components/sidebar/ProcessParams.tsx` | 可编辑工艺参数卡片 |
+| `src/components/sidebar/ToolPlanCard.tsx` | 刀具选配方案卡片 |
+| `src/components/sidebar/GCodeResult.tsx` | G-Code 结果与下载卡片 |
+| `src/components/sidebar/RecentJobs.tsx` | 最近作业列表 |
+| `src/components/Toolbar3D.tsx` | 3D 预览区交互模式工具栏 |
+| `src/components/ModelViewer.tsx` | 3D 模型渲染：OBJ/STL/GLB 加载、共面洪泛面高亮、测量、刀路叠加 |
+| `src/components/ToolpathViewer.tsx` | 刀路 3D 可视化：G0/G1/G2/G3 分色线段（含圆弧细分渲染）、起止标记 |
 | `src/components/ErrorBoundary.tsx` | React 错误边界，捕获 3D 渲染崩溃 |
-| `src/App.css` | 自定义滚动条样式 |
 | `.env` | `VITE_API_BASE_URL=http://localhost:8000` |
 
 ### 2.2 业务计算与总线层 (Backend)
@@ -88,7 +105,7 @@
 | `routers/internal_jobs.py` | **内部查询**: recent 列表与 detail 接口，支持恢复历史作业 |
 | `routers/jobs.py` | **v2 同步**: 任务提交与状态查询（已简化为同步处理） |
 | `services/geometry_engine.py` | CadQuery STEP 解析、制造特征识别（孔/型腔/凸台）、STL/GLB 导出 |
-| `services/cam_engine.py` | Stock-aware CAM 引擎：毛坯计算 + 截面差集 + 扫描线生成 + 内置刀具库 + 自动选刀 + **刀路坐标逆变换回模型空间** |
+| `services/cam_engine.py` | 多阶段 CAM 引擎：stock-aware 粗加工 (G0/G1) + 孔螺旋铣削 (G2/G3) + 型腔轮廓铣削 (G2/G3) + 多刀具 G-code 编排 + 动态安全高度 + GRBL 标准头尾 + 刀路坐标逆变换回模型空间 |
 | `tasks.py` | 同步任务函数：parse_step_task / generate_cam_task |
 
 ### 2.3 底层几何与 CAM 引擎池
@@ -108,18 +125,46 @@
   * 尝试 GLB/GLTF 导出（失败自动回退 STL）
 * Mock 降级: CadQuery 不可用时，生成基于 bbox 的方盒 OBJ + 6 面拓扑
 
-#### 2.3.2 CAM 规划 (Stock-aware Roughing + OpenCAMLib Optional)
-* **Stock-aware 粗加工** (默认策略):
+#### 2.3.2 CAM 规划 (多阶段加工 + OpenCAMLib Optional)
+* **多阶段加工管线**:
+  1. **Phase 1 — 粗加工** (G0/G1): Stock-aware 毛坯去除
+  2. **Phase 2 — Z 轴孔螺旋铣削** (G2/G3): 基于识别到的孔特征，使用 G2 圆弧螺旋下刀
+  3. **Phase 3 — 型腔轮廓铣削** (G2/G3): 矩形型腔逐层轮廓加工，圆角处使用 G2 圆弧
+  4. **Phase 4 — 轮廓精加工** (G1): 预留接口
+
+* **Phase 1 Stock-aware 粗加工** (默认策略):
   1. **毛坯计算**: 模型包围盒各方向外扩 3mm (`_compute_stock`)
   2. **逐层切片**: 从毛坯顶面向下，按 `step_down` 分层
   3. **截面差集**: 每层用 trimesh 截取零件截面 → shapely 2D 差集 (stock - part) 得出去除区域
   4. **扫描线填充**: 在去除区域内生成 zigzag 扫描路径
   5. **坐标还原**: 利用 `to_planar()` 返回的 `to_3D` 仿射矩阵还原截面坐标到网格空间
+
+* **Phase 2 孔螺旋铣削** (`_generate_hole_helical_toolpath`):
+  1. 仅处理 `axis == "z"` 的孔（非 Z 轴孔标记为需要 4/5 轴或重新装夹）
+  2. G0 快移到孔中心 XY → 下降到零件表面
+  3. G2 半圆弧螺旋下降到孔底，螺旋半径 = `(hole_diameter/2 - tool_radius)`
+  4. G2 全圆清底精铣
+  5. G0 抬刀到安全高度
+  6. 自动调整主轴转速和进给（小刀高转速、低进给）
+
+* **Phase 3 型腔轮廓铣削** (`_generate_pocket_contour_toolpath`):
+  1. 计算刀具半径补偿后的轮廓偏置
+  2. 逐层下刀，每层沿矩形轮廓走一圈
+  3. 直边段 G1 线性进给，四角处 G2 圆弧过渡
+  4. 支持任意 step_down 分层
+
+* **底面穿透防护**: 特征加工深度钳位（`depth = min(depth, part_top_z)`），确保孔/型腔刀路不超过零件厚度；粗加工底部保留 0.2mm 安全间隙（`BOTTOM_CLEARANCE`），防止刀具触碰夹具
+* **动态安全高度**: `safe_z = 10mm`（零件顶面上方 10mm），不再使用硬编码常量
+* **GRBL 标准 G-code 格式**:
+  * 头部: G17 (XY 平面) / G21 (公制) / G90 (绝对坐标) / G40 (取消刀补) / G49 (取消刀长补偿)
+  * 每把刀: T{n} M6 (换刀) + S{rpm} M3 (主轴启动) + G4 P1 (延时等待)
+  * 尾部: G28 G91 Z0 (Z 回原点) / G28 G91 X0 Y0 (XY 回原点) / M5 (主轴停) / M9 (冷却关) / M30 (程序结束)
+* **多刀具编排**: G-code 按刀具分组输出，每组含 T/M6 换刀指令、独立主轴转速
 * **坐标变换管线** (装夹面 → 模型空间):
   1. `_load_prepared_mesh`: 加载网格 → 按装夹面法向旋转 (setup_normal → (0,0,-1)) → 平移到原点 → 记录正向变换矩阵 `forward = T @ R`，计算逆矩阵 `inverse = forward⁻¹`
   2. 刀路生成：在 prepared 坐标系下生成 (XY 为 prepared 坐标，Z 为 G-code 机床坐标 Z=0 在零件顶面)
-  3. `_segments_machine_z_to_prepared`: 将 Z 从机床坐标系转换到 prepared 坐标系 (`z += part_top_z`)
-  4. `_transform_segments_to_model_space`: 应用逆矩阵将 prepared 坐标还原到原始模型坐标系
+  3. `_segments_machine_z_to_prepared`: 将 Z 从机床坐标系转换到 prepared 坐标系 (`z += part_top_z`)，包括 G2/G3 圆弧中心点
+  4. `_transform_segments_to_model_space`: 应用逆矩阵将 prepared 坐标还原到原始模型坐标系，包括圆弧中心点
   5. 前端接收到模型空间坐标，直接与模型同组渲染，无需额外变换
 * **Z 轴约定**: 选定装夹面后，加工 Z 轴 = 装夹面法向的反方向 (面朝下放置，刀具从上方加工)
 * **内置刀具库** (6 把): D2/D3/D4/D5/D6/D8 平底铣刀
@@ -128,8 +173,9 @@
   * 孔: 不超过孔径 80% 的最大刀
   * 型腔: 不超过最窄边 60% 的最大刀
   * 凸台: 沿用粗加工刀
+* **切削参数自适应**: 小刀具自动提高主轴转速 (RPM ∝ ref_d/tool_d, 上限 24000)、降低进给 (feed ∝ tool_d/ref_d)
 * **OpenCAMLib**: 仍为运行时可选增强，当前默认走 stock-aware 粗加工
-* 接口契约始终一致：返回刀路分段 (G0/G1, 模型空间坐标) + G-Code (机床坐标) + 刀具方案
+* 接口契约始终一致：返回刀路分段 (G0/G1/G2/G3, 模型空间坐标) + G-Code (机床坐标) + 刀具方案
 
 ---
 
@@ -167,11 +213,12 @@
    - 应用逆变换矩阵将刀路坐标还原到原始模型坐标系
    - OpenCAMLib 可用时优先使用，否则自动降级
 5. 产出：
-   - **刀路分段** (G0 快速移动/G1 切削, **模型坐标系**) 供前端 3D 可视化直接叠加
-   - **G-Code 文件** (.nc, **机床坐标系**) 落盘 + 返回 URL
+   - **刀路分段** (G0 快速移动/G1 切削/G2/G3 圆弧插补, **模型坐标系**) 供前端 3D 可视化直接叠加
+   - **G-Code 文件** (.nc, **机床坐标系**, GRBL 兼容格式含 G17/G21/G90/G40/G49 头部 + G28/M5/M9/M30 尾部) 落盘 + 返回 URL
+   - **多刀具 G-code**: 按刀具分组，每组含 T/M6 换刀 + 独立主轴转速
    - **刀具选配方案** (roughing_tool + feature_tools) 含选刀理由
-   - **加工时间估算** (基于切削总长 / 进给率)
-   - **统计信息** (层数、切削总长、毛坯尺寸) 写入 `cam_result.json`
+   - **加工时间估算** (基于切削总长 / 进给率，含圆弧长度)
+   - **统计信息** (层数、切削总长、毛坯尺寸、特征加工数) 写入 `cam_result.json`
 6. Job 状态：`uploaded` → `generating` → `done` (或 → `failed`)
 7. 前端恢复功能：后续页面刷新或点击"最近作业"可重新打开本次结果
 
@@ -210,13 +257,28 @@ CNC/
 │   ├── vite.config.ts             # Vite + TailwindCSS v4 插件
 │   ├── tailwind.config.js         # Tailwind 内容扫描配置
 │   └── src/
-│       ├── App.tsx                # 主应用组件
+│       ├── types.ts               # 共享类型 + 格式化函数
+│       ├── App.tsx                # 主编排器 (状态 + API + 布局)
 │       ├── App.css                # 自定义样式
 │       ├── index.css              # 全局样式 + Tailwind v4 导入
 │       └── components/
+│           ├── ui/
+│           │   ├── SectionCard.tsx     # 通用卡片组件
+│           │   ├── StatusBadge.tsx     # 状态徽章
+│           │   └── ExpertBadge.tsx     # 专家推荐/默认值标签
+│           ├── sidebar/
+│           │   ├── UploadArea.tsx      # 文件上传区
+│           │   ├── CurrentJobCard.tsx  # 当前作业卡片
+│           │   ├── ManufacturingFeatures.tsx # 加工特征识别
+│           │   ├── ModelFeatures.tsx   # 模型特征
+│           │   ├── ProcessParams.tsx   # 可编辑工艺参数
+│           │   ├── ToolPlanCard.tsx    # 刀具选配方案
+│           │   ├── GCodeResult.tsx     # G-Code 结果/下载
+│           │   └── RecentJobs.tsx      # 最近作业列表
+│           ├── Toolbar3D.tsx      # 3D 交互模式工具栏
 │           ├── ModelViewer.tsx     # 3D 模型 + 面拾取 + 测量
 │           ├── ToolpathViewer.tsx  # 刀路 3D 可视化
-│           └── ErrorBoundary.tsx  # 错误边界
+│           └── ErrorBoundary.tsx   # 错误边界
 └── spec.md                        # 本文档
 ```
 
@@ -308,6 +370,9 @@ cd frontend && npm run dev
 | **刀路与模型坐标系不对齐** | 后端生成刀路时先旋转+平移网格到 prepared 坐标系，但刀路坐标未还原回原始模型空间，导致前端渲染时刀路偏移模型。 | `_load_prepared_mesh` 记录正向变换矩阵并计算逆矩阵；`_transform_segments_to_model_space` 将刀路坐标逆变换回原始模型空间，前端直接与模型同组渲染。 |
 | **刀路 Z 坐标混用导致偏移** | 刀路 XY 使用 prepared 绝对坐标，但 Z 使用 G-code 机床坐标 (Z=0 在零件顶面)，逆变换时混合坐标系导致 Z 方向严重偏移。 | 新增 `_segments_machine_z_to_prepared`：在逆变换前将 Z 从机床坐标转为 prepared 绝对坐标 (`z += part_top_z`)，确保 XYZ 三轴统一在 prepared 坐标系下再做逆变换。 |
 | **装夹面箭头方向错误** | 面高亮箭头指向面法向方向，但 CNC 约定加工 Z 轴 = 装夹面法向的反方向。 | 箭头方向改为 `normal.negate()`，指示加工 Z 轴方向（刀具进入方向）。 |
+| **前端单文件膨胀** | `App.tsx` 承载全部 UI (~800 行)，类型定义/辅助函数/业务组件混杂，维护困难。 | 模块化重构：抽取 `types.ts` 共享层 + `ui/` 原子组件 (`SectionCard`/`StatusBadge`/`ExpertBadge`) + `sidebar/` 8 个业务卡片组件 + `Toolbar3D`，`App.tsx` 精简至 ~170 行纯编排。 |
+| **刀路穿透模型 (底层边界条件)** | `_extract_section_geometry` 对 `z_min` 和 `z_max` 边界均返回空截面。当装夹面翻转后，prepared 坐标系 `z_min` 对应模型原始顶面，空截面导致 `_compute_removal_regions` 将整个毛坯面积视为去除区域，刀路直接穿过模型。 | 三重修复：(1) 边界条件仅对 `z >= z_max` 返回空截面，`z_min` 附近钳位到 `z_min + 0.05` 提取有效截面；(2) 逐层维护累积截面并集 (`cumulative_section`)，确保任意层截面提取失败时仍有前序有效截面保护零件；(3) `_generate_bbox_fallback` 不再生成全区域扫描，改为返回空刀路 + 警告信息。 |
+|| **刀路穿透底面 (特征深度越界)** | 特征识别返回的深度 (depth) 可能超过零件在加工方向上的实际厚度（如 10mm 厚零件检测到 12mm 孔深或 245mm 型腔深度），`_generate_hole_helical_toolpath` 和 `_generate_pocket_contour_toolpath` 直接使用 `z_end = -depth` 未做钳位，导致刀路远低于底面。同时粗加工层循环切到 `stock_bot_z = part_bottom_z`，刀具中心恰好在底面位置。 | 三处修复：(1) 孔加工深度钳位 `depth = min(depth, part_top_z)`，确保螺旋铣削不超过零件厚度；(2) 型腔加工同样钳位；(3) 粗加工底部 Z 增加 `BOTTOM_CLEARANCE = 0.2mm` 安全间隙，防止刀具触碰夹具。 |
 
 ---
 
@@ -448,8 +513,8 @@ cd frontend && npm run dev
 
 | 角色 | 职责范围 | 主责文件 |
 | :--- | :--- | :--- |
-| **A — 前端流程** | 上传/作业恢复/参数面板/结果面板/下载 | `App.tsx`, `App.css`, `index.css` |
-| **B — 前端 3D** | 模型加载/测量/选面/刀路叠加/渲染性能 | `ModelViewer.tsx`, `ToolpathViewer.tsx`, `ErrorBoundary.tsx` |
+| **A — 前端流程** | 上传/作业恢复/参数面板/结果面板/下载 | `App.tsx`, `types.ts`, `sidebar/*`, `ui/*` |
+| **B — 前端 3D** | 模型加载/测量/选面/刀路叠加/渲染性能 | `ModelViewer.tsx`, `ToolpathViewer.tsx`, `Toolbar3D.tsx`, `ErrorBoundary.tsx` |
 | **C — 后端编排** | API 契约/DB 模型/状态机/错误码/任务编排 | `main.py`, `database.py`, `models.py`, `routers/*`, `tasks.py` |
 | **D — 几何/CAM** | STEP 解析/特征识别/OCL 接入/推荐引擎 | `geometry_engine.py`, `cam_engine.py`, `craftsman.py` |
 

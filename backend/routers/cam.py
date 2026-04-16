@@ -17,7 +17,6 @@ from services.cam_engine import (
 
 router = APIRouter()
 
-SAFE_Z = 5.0
 STEP_OVER_RATIO = 0.4
 
 
@@ -114,12 +113,13 @@ async def generate_toolpath(req: GenerateRequest, db: Session = Depends(get_db))
                 feed_rate=req.feed_rate,
                 tool_diameter=roughing_diameter,
                 step_over_ratio=STEP_OVER_RATIO,
-                safe_z=SAFE_Z,
                 setup_normal=(
                     req.selected_face.normal.x,
                     req.selected_face.normal.y,
                     req.selected_face.normal.z,
                 ) if req.selected_face else None,
+                manufacturing_features=mfg_features,
+                tool_plan=tool_plan,
             )
         )
     except CamEngineError as e:

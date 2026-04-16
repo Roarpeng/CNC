@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -13,10 +13,13 @@ from shapely.geometry.base import BaseGeometry
 from shapely.ops import unary_union
 
 
-SAFE_Z_DEFAULT = 5.0
+SAFE_Z_CLEARANCE = 10.0
 AREA_EPS = 1e-3
 SEGMENT_EPS = 1e-3
 STOCK_MARGIN = 3.0
+ARC_TESSELLATION_STEPS = 24
+HELIX_STEP_DOWN_PER_REV = 1.0
+BOTTOM_CLEARANCE = 0.2
 
 TOOL_LIBRARY: list[dict[str, Any]] = [
     {"id": 1, "diameter": 2.0, "name": "D2 平底铣刀", "type": "flat_endmill", "flutes": 2},
@@ -41,10 +44,6 @@ def select_tools_for_features(
     manufacturing_features: list[dict[str, Any]],
     part_dims: dict[str, float] | None = None,
 ) -> dict[str, Any]:
-    """
-    Based on recognized manufacturing features, recommend a roughing tool
-    and per-feature finishing tools from the built-in library.
-    """
     min_part_dim = 999.0
     if part_dims:
         min_part_dim = min(part_dims.get("bbox_x", 999), part_dims.get("bbox_y", 999))
@@ -111,15 +110,20 @@ class CamInputs:
     feed_rate: float
     tool_diameter: float = 6.0
     step_over_ratio: float = 0.4
-    safe_z: float = SAFE_Z_DEFAULT
+    safe_z: float = SAFE_Z_CLEARANCE
     setup_normal: tuple[float, float, float] | None = None
+    manufacturing_features: list[dict[str, Any]] = field(default_factory=list)
+    tool_plan: dict[str, Any] | None = None
 
+
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
 
 def generate_cam_with_ocl(inputs: CamInputs) -> dict[str, Any]:
-    """
-    Preferred pipeline: OpenCAMLib drop-cutter.
-    If runtime binding is unavailable, falls back to a deterministic planar roughing path
-    while keeping the same API contract.
+    """Multi-phase CAM pipeline:
+    1. Stock-aware roughing (G0/G1)
+    2. Feature-based finishing — Z-axis holes (G2/G3 helical), pockets (G2/G3 contour)
 
     Toolpath segment coordinates are returned in the original model coordinate
     space so the frontend can overlay them directly on the un-rotated mesh.
@@ -127,19 +131,56 @@ def generate_cam_with_ocl(inputs: CamInputs) -> dict[str, Any]:
     try:
         mesh, inverse_transform = _load_prepared_mesh(inputs)
         part_bounds = mesh.bounds
+        part_top_z = float(part_bounds[1][2])
+
+        dynamic_safe_z = SAFE_Z_CLEARANCE
+        inputs = CamInputs(
+            job_id=inputs.job_id,
+            mesh_path=inputs.mesh_path,
+            bbox_x=inputs.bbox_x,
+            bbox_y=inputs.bbox_y,
+            z_depth=inputs.z_depth,
+            step_down=inputs.step_down,
+            spindle_speed=inputs.spindle_speed,
+            feed_rate=inputs.feed_rate,
+            tool_diameter=inputs.tool_diameter,
+            step_over_ratio=inputs.step_over_ratio,
+            safe_z=dynamic_safe_z,
+            setup_normal=inputs.setup_normal,
+            manufacturing_features=inputs.manufacturing_features,
+            tool_plan=inputs.tool_plan,
+        )
 
         if _has_ocl_runtime():
             result = _generate_dropcutter_toolpath(inputs, mesh, part_bounds)
         else:
             result = _generate_planar_fallback(inputs, mesh, part_bounds, strategy="stock_aware_fallback")
 
-        part_top_z = float(part_bounds[1][2])
+        forward_transform = np.linalg.inv(inverse_transform)
+        feature_result = _generate_feature_toolpaths(inputs, part_bounds, forward_transform)
+        if feature_result["toolpath_segments"]:
+            result["gcode_lines"].extend(feature_result["gcode_lines"])
+            result["toolpath_segments"].extend(feature_result["toolpath_segments"])
+            result["stats"]["feature_ops"] = feature_result["stats"]
+            cut_extra = _cutting_length(feature_result["toolpath_segments"])
+            result["stats"]["total_cut_length_mm"] = round(
+                result["stats"]["total_cut_length_mm"] + cut_extra, 1
+            )
+            if inputs.feed_rate > 0:
+                result["estimated_time_minutes"] = round(
+                    result["stats"]["total_cut_length_mm"] / inputs.feed_rate, 1
+                )
+
         _segments_machine_z_to_prepared(result["toolpath_segments"], part_top_z)
         _transform_segments_to_model_space(result["toolpath_segments"], inverse_transform)
         return result
     except Exception as exc:
         raise CamEngineError(f"CAM 生成失败: {exc}") from exc
 
+
+# ---------------------------------------------------------------------------
+# Mesh preparation
+# ---------------------------------------------------------------------------
 
 def _load_prepared_mesh(inputs: CamInputs) -> tuple[trimesh.Trimesh, np.ndarray]:
     """Load mesh, apply setup rotation + origin translation; return (prepared, inverse_4x4)."""
@@ -170,6 +211,10 @@ def _load_prepared_mesh(inputs: CamInputs) -> tuple[trimesh.Trimesh, np.ndarray]
     return prepared, inverse
 
 
+# ---------------------------------------------------------------------------
+# Coordinate transforms
+# ---------------------------------------------------------------------------
+
 def _segments_machine_z_to_prepared(
     segments: list[dict[str, Any]],
     part_top_z: float,
@@ -179,6 +224,8 @@ def _segments_machine_z_to_prepared(
     for seg in segments:
         for key in ("from", "to"):
             seg[key][2] += part_top_z
+        if "center" in seg and seg["center"] is not None and len(seg["center"]) >= 3:
+            seg["center"][2] += part_top_z
 
 
 def _transform_segments_to_model_space(
@@ -193,6 +240,10 @@ def _transform_segments_to_model_space(
             pt = np.asarray(seg[key], dtype=float)
             transformed = rot @ pt + trans
             seg[key] = [round(float(transformed[0]), 6), round(float(transformed[1]), 6), round(float(transformed[2]), 6)]
+        if "center" in seg and seg["center"] is not None and len(seg["center"]) >= 3:
+            pt = np.asarray(seg["center"], dtype=float)
+            transformed = rot @ pt + trans
+            seg["center"] = [round(float(transformed[0]), 6), round(float(transformed[1]), 6), round(float(transformed[2]), 6)]
 
 
 def _rotation_matrix_from_vectors(source: np.ndarray, target: np.ndarray) -> np.ndarray:
@@ -225,17 +276,57 @@ def _rotation_matrix_from_vectors(source: np.ndarray, target: np.ndarray) -> np.
 def _has_ocl_runtime() -> bool:
     try:
         import ocl  # type: ignore
-
         return ocl is not None
     except Exception:
         return False
 
 
+# ---------------------------------------------------------------------------
+# G-code helpers
+# ---------------------------------------------------------------------------
+
+def _gcode_header(inputs: CamInputs, extents: np.ndarray) -> list[str]:
+    return [
+        f"(Cloud CAM Generated for Job {inputs.job_id})",
+        f"(Model: {float(extents[0]):.1f} x {float(extents[1]):.1f} x {float(extents[2]):.1f} mm)",
+        f"(Params: step_down={inputs.step_down} spindle={inputs.spindle_speed} feed={inputs.feed_rate})",
+        "G17 (XY plane selection)",
+        "G21 (metric)",
+        "G90 (absolute positioning)",
+        "G40 (cancel cutter radius compensation)",
+        "G49 (cancel tool length offset)",
+    ]
+
+
+def _gcode_tool_start(tool: dict[str, Any], spindle_speed: int, label: str = "") -> list[str]:
+    tid = tool.get("id", 1)
+    name = tool.get("name", f"D{tool.get('diameter', 0)}")
+    lines = [
+        f"(--- Tool T{tid}: {name}{', ' + label if label else ''} ---)",
+        f"T{tid} M6",
+        f"S{spindle_speed} M3",
+        "G4 P1 (dwell 1s for spindle ramp-up)",
+    ]
+    return lines
+
+
+def _gcode_footer(safe_z: float) -> list[str]:
+    return [
+        f"G0 Z{safe_z:.3f} (retract)",
+        "G28 G91 Z0 (return Z home)",
+        "G28 G91 X0 Y0 (return XY home)",
+        "G90 (restore absolute)",
+        "M5 (spindle stop)",
+        "M9 (coolant off)",
+        "M30 (program end)",
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: Stock-aware roughing
+# ---------------------------------------------------------------------------
+
 def _generate_dropcutter_toolpath(inputs: CamInputs, mesh: trimesh.Trimesh, part_bounds: np.ndarray) -> dict[str, Any]:
-    """
-    Stock-aware roughing currently shares the same planner for OCL/non-OCL paths.
-    This keeps the generated path conservative and avoids machining away the part.
-    """
     return _generate_planar_fallback(inputs, mesh, part_bounds, strategy="stock_aware_roughing")
 
 
@@ -249,29 +340,38 @@ def _generate_planar_fallback(inputs: CamInputs, mesh: trimesh.Trimesh, part_bou
     stock_height = float(stock_bounds[1][2] - stock_bounds[0][2])
     num_layers = max(1, math.ceil(stock_height / step_down))
 
-    gcode_lines = [
-        f"(Cloud CAM Generated for Job {inputs.job_id})",
-        f"(Model: {float(extents[0]):.1f} x {float(extents[1]):.1f} x {float(extents[2]):.1f} mm)",
-        f"(Params: step_down={inputs.step_down} spindle={inputs.spindle_speed} feed={inputs.feed_rate})",
-        f"(Strategy: {strategy})",
-        "G21 (metric)",
-        "G90 (absolute)",
-        f"S{inputs.spindle_speed} M3",
-        f"G0 Z{inputs.safe_z}",
-    ]
+    roughing_tool = (inputs.tool_plan or {}).get("roughing_tool") or {
+        "id": 1, "diameter": inputs.tool_diameter, "name": f"D{inputs.tool_diameter:.0f}"
+    }
+
+    gcode_lines = _gcode_header(inputs, extents)
+    gcode_lines.append(f"(Strategy: {strategy})")
+    gcode_lines.extend(_gcode_tool_start(roughing_tool, inputs.spindle_speed, "Roughing"))
+    gcode_lines.append(f"G0 Z{inputs.safe_z:.3f}")
 
     toolpath_segments: list[dict[str, Any]] = []
     prev = [0.0, 0.0, inputs.safe_z]
     machined_layers = 0
 
     stock_top_z = float(stock_bounds[1][2])
-    stock_bot_z = float(stock_bounds[0][2])
+    stock_bot_z = float(stock_bounds[0][2]) + BOTTOM_CLEARANCE
     part_top_z = float(part_bounds[1][2])
+
+    cumulative_section: BaseGeometry = GeometryCollection()
 
     for layer in range(num_layers):
         cut_plane_z = max(stock_top_z - step_down * (layer + 1), stock_bot_z)
         cut_depth = cut_plane_z - part_top_z
-        removal_geometry = _compute_removal_regions(mesh, stock_bounds, cut_plane_z, tool_radius)
+        current_section = _extract_section_geometry(mesh, cut_plane_z)
+        if not current_section.is_empty:
+            if cumulative_section.is_empty:
+                cumulative_section = current_section
+            else:
+                cumulative_section = unary_union([cumulative_section, current_section])
+        removal_geometry = _compute_removal_regions(
+            mesh, stock_bounds, cut_plane_z, tool_radius,
+            part_section_override=cumulative_section if not cumulative_section.is_empty else None,
+        )
         if removal_geometry.is_empty:
             continue
 
@@ -300,8 +400,10 @@ def _generate_planar_fallback(inputs: CamInputs, mesh: trimesh.Trimesh, part_bou
     if not toolpath_segments:
         return _generate_bbox_fallback(inputs, stock_bounds, strategy=f"{strategy}_bbox")
 
+    gcode_lines.append("M5 (spindle stop after roughing)")
+
     toolpath_segments.append({"type": "G0", "from": list(prev), "to": [0.0, 0.0, inputs.safe_z]})
-    gcode_lines.extend(["G0 X0 Y0", "M5", "M30"])
+    gcode_lines.append(f"G0 X0 Y0 Z{inputs.safe_z:.3f}")
 
     total_cut_len = _cutting_length(toolpath_segments)
 
@@ -322,6 +424,312 @@ def _generate_planar_fallback(inputs: CamInputs, mesh: trimesh.Trimesh, part_bou
     }
 
 
+# ---------------------------------------------------------------------------
+# Phase 2 & 3: Feature-based toolpaths (holes, pockets)
+# ---------------------------------------------------------------------------
+
+def _generate_feature_toolpaths(
+    inputs: CamInputs,
+    part_bounds: np.ndarray,
+    forward_transform: np.ndarray,
+) -> dict[str, Any]:
+    """Generate G2/G3 toolpaths for recognized manufacturing features.
+    Feature center coordinates arrive in model space — they must be transformed
+    to prepared-mesh space via *forward_transform* so that the downstream
+    _segments_machine_z_to_prepared + _transform_segments_to_model_space
+    pipeline can convert them back correctly (same as roughing segments)."""
+    features = inputs.manufacturing_features
+    tool_plan = inputs.tool_plan
+    if not features or not tool_plan:
+        return {"gcode_lines": [], "toolpath_segments": [], "stats": {}}
+
+    feature_tools = tool_plan.get("feature_tools", [])
+    part_top_z = float(part_bounds[1][2])
+
+    tool_groups: dict[int, list[tuple[dict[str, Any], dict[str, Any]]]] = {}
+    for feat, ft_entry in zip(features, feature_tools):
+        tool = ft_entry.get("tool")
+        if tool is None:
+            continue
+        tid = tool["id"]
+        tool_groups.setdefault(tid, []).append((feat, ft_entry))
+
+    all_gcode: list[str] = []
+    all_segments: list[dict[str, Any]] = []
+    stats: dict[str, Any] = {"holes_machined": 0, "pockets_machined": 0, "skipped_non_z_holes": 0}
+
+    for tid, group in sorted(tool_groups.items()):
+        tool = group[0][1]["tool"]
+        tool_radius = tool["diameter"] / 2.0
+        spindle_speed = _adjusted_spindle(inputs.spindle_speed, tool["diameter"], inputs.tool_diameter)
+        feed = _adjusted_feed(inputs.feed_rate, tool["diameter"], inputs.tool_diameter)
+
+        tool_segs: list[dict[str, Any]] = []
+        tool_gcode: list[str] = []
+
+        for feat, ft_entry in group:
+            ftype = feat.get("type", "")
+            prepared_feat = _transform_feature_to_prepared(feat, forward_transform, part_top_z)
+            if ftype == "hole":
+                if feat.get("axis") != "z":
+                    stats["skipped_non_z_holes"] += 1
+                    continue
+                h_segs, h_gcode = _generate_hole_helical_toolpath(
+                    prepared_feat, tool_radius, feed, inputs.safe_z, part_top_z,
+                )
+                tool_segs.extend(h_segs)
+                tool_gcode.extend(h_gcode)
+                stats["holes_machined"] += 1
+            elif ftype == "pocket":
+                p_segs, p_gcode = _generate_pocket_contour_toolpath(
+                    prepared_feat, tool_radius, feed, inputs.safe_z, part_top_z, inputs.step_down,
+                )
+                tool_segs.extend(p_segs)
+                tool_gcode.extend(p_gcode)
+                stats["pockets_machined"] += 1
+
+        if tool_segs:
+            all_gcode.extend(_gcode_tool_start(tool, spindle_speed, ft_entry.get("reason", "")))
+            all_gcode.append(f"G0 Z{inputs.safe_z:.3f}")
+            all_gcode.extend(tool_gcode)
+            all_gcode.append("M5 (spindle stop)")
+            all_segments.extend(tool_segs)
+
+    if all_gcode:
+        all_gcode.extend(_gcode_footer(inputs.safe_z))
+
+    return {"gcode_lines": all_gcode, "toolpath_segments": all_segments, "stats": stats}
+
+
+def _transform_feature_to_prepared(
+    feat: dict[str, Any],
+    forward_transform: np.ndarray,
+    part_top_z: float,
+) -> dict[str, Any]:
+    """Transform a feature's center from model space to prepared-mesh space,
+    and convert Z to machine coordinates (Z=0 at part top)."""
+    prepared = dict(feat)
+    center = feat.get("center")
+    if center is None:
+        return prepared
+
+    pt_model = np.array([
+        float(center.get("x", 0)),
+        float(center.get("y", 0)),
+        float(center.get("z", 0)),
+        1.0,
+    ], dtype=float)
+    pt_prepared = forward_transform @ pt_model
+
+    prepared["center"] = {
+        "x": float(pt_prepared[0]),
+        "y": float(pt_prepared[1]),
+        "z": float(pt_prepared[2]),
+    }
+    return prepared
+
+
+def _adjusted_spindle(base_rpm: int, tool_d: float, ref_d: float) -> int:
+    """Smaller tools need higher RPM to maintain surface speed."""
+    if tool_d <= 0 or ref_d <= 0:
+        return base_rpm
+    ratio = ref_d / tool_d
+    return min(int(base_rpm * ratio), 24000)
+
+
+def _adjusted_feed(base_feed: float, tool_d: float, ref_d: float) -> float:
+    """Smaller tools need proportionally lower feed."""
+    if tool_d <= 0 or ref_d <= 0:
+        return base_feed
+    ratio = tool_d / ref_d
+    return round(base_feed * ratio, 0)
+
+
+def _generate_hole_helical_toolpath(
+    feat: dict[str, Any],
+    tool_radius: float,
+    feed: float,
+    safe_z: float,
+    part_top_z: float,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Generate helical milling toolpath for a Z-axis hole using G2 arcs."""
+    cx = float(feat["center"]["x"])
+    cy = float(feat["center"]["y"])
+    hole_radius = float(feat.get("diameter", 0)) / 2.0
+    depth = min(float(feat.get("depth", 0)), part_top_z)
+
+    helix_radius = hole_radius - tool_radius
+    if helix_radius < 0.05:
+        return [], []
+
+    z_start = 0.0
+    z_end = -depth
+    plunge_feed = feed * 0.3
+    step_per_rev = min(HELIX_STEP_DOWN_PER_REV, depth)
+
+    segments: list[dict[str, Any]] = []
+    gcode: list[str] = []
+
+    start_x = cx + helix_radius
+    start_y = cy
+
+    gcode.append(f"(Hole D{hole_radius * 2:.1f} at X{cx:.1f} Y{cy:.1f})")
+    segments.append({"type": "G0", "from": [0.0, 0.0, safe_z], "to": [start_x, start_y, safe_z]})
+    gcode.append(f"G0 X{start_x:.3f} Y{start_y:.3f} Z{safe_z:.3f}")
+
+    segments.append({"type": "G0", "from": [start_x, start_y, safe_z], "to": [start_x, start_y, z_start]})
+    gcode.append(f"G0 Z{z_start:.3f}")
+
+    current_z = z_start
+    i_off = cx - start_x
+    j_off = cy - start_y
+
+    while current_z > z_end + 1e-6:
+        next_z = max(current_z - step_per_rev, z_end)
+
+        z_mid = (current_z + next_z) / 2.0
+        from_pt = [start_x, start_y, current_z]
+        mid_pt = [cx - helix_radius, cy, z_mid]
+        to_pt = [start_x, start_y, next_z]
+
+        segments.append({
+            "type": "G2", "from": from_pt, "to": list(mid_pt),
+            "center": [cx, cy, z_mid], "radius": helix_radius,
+        })
+        gcode.append(f"G2 X{mid_pt[0]:.3f} Y{mid_pt[1]:.3f} Z{z_mid:.3f} I{i_off:.3f} J{j_off:.3f} F{plunge_feed:.0f}")
+
+        i_off_2 = cx - mid_pt[0]
+        j_off_2 = cy - mid_pt[1]
+        segments.append({
+            "type": "G2", "from": list(mid_pt), "to": list(to_pt),
+            "center": [cx, cy, next_z], "radius": helix_radius,
+        })
+        gcode.append(f"G2 X{to_pt[0]:.3f} Y{to_pt[1]:.3f} Z{next_z:.3f} I{i_off_2:.3f} J{j_off_2:.3f} F{plunge_feed:.0f}")
+
+        current_z = next_z
+
+    cleanup_mid = [cx - helix_radius, cy, z_end]
+    cleanup_end = [start_x, start_y, z_end]
+    segments.append({
+        "type": "G2", "from": [start_x, start_y, z_end], "to": list(cleanup_mid),
+        "center": [cx, cy, z_end], "radius": helix_radius,
+    })
+    gcode.append(f"G2 X{cleanup_mid[0]:.3f} Y{cleanup_mid[1]:.3f} I{i_off:.3f} J{j_off:.3f} F{feed:.0f}")
+
+    i_off_2 = cx - cleanup_mid[0]
+    j_off_2 = cy - cleanup_mid[1]
+    segments.append({
+        "type": "G2", "from": list(cleanup_mid), "to": list(cleanup_end),
+        "center": [cx, cy, z_end], "radius": helix_radius,
+    })
+    gcode.append(f"G2 X{cleanup_end[0]:.3f} Y{cleanup_end[1]:.3f} I{i_off_2:.3f} J{j_off_2:.3f} F{feed:.0f}")
+
+    segments.append({"type": "G0", "from": list(cleanup_end), "to": [start_x, start_y, safe_z]})
+    gcode.append(f"G0 Z{safe_z:.3f}")
+
+    return segments, gcode
+
+
+def _generate_pocket_contour_toolpath(
+    feat: dict[str, Any],
+    tool_radius: float,
+    feed: float,
+    safe_z: float,
+    part_top_z: float,
+    step_down: float,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Generate rectangular contour toolpath for a pocket feature with rounded corners."""
+    center = feat.get("center", {})
+    cx = float(center.get("x", 0))
+    cy = float(center.get("y", 0))
+    depth = min(float(feat.get("depth", 0)), part_top_z)
+    bounds = feat.get("bounds", {})
+    bx = float(bounds.get("x", 0)) / 2.0
+    by = float(bounds.get("y", 0)) / 2.0
+
+    if bx < tool_radius + 0.1 or by < tool_radius + 0.1 or depth <= 0:
+        return [], []
+
+    offset_x = bx - tool_radius
+    offset_y = by - tool_radius
+    corner_r = min(tool_radius, offset_x, offset_y)
+
+    segments: list[dict[str, Any]] = []
+    gcode: list[str] = []
+
+    gcode.append(f"(Pocket {bx * 2:.1f}x{by * 2:.1f} depth {depth:.1f} at X{cx:.1f} Y{cy:.1f})")
+
+    z_start = 0.0
+    z_end = -depth
+    num_layers = max(1, math.ceil(depth / max(step_down, 0.1)))
+    plunge_feed = feed * 0.3
+
+    entry_x = cx + offset_x - corner_r
+    entry_y = cy - offset_y
+
+    segments.append({"type": "G0", "from": [0.0, 0.0, safe_z], "to": [entry_x, entry_y, safe_z]})
+    gcode.append(f"G0 X{entry_x:.3f} Y{entry_y:.3f} Z{safe_z:.3f}")
+
+    for layer_i in range(num_layers):
+        z = max(z_start - step_down * (layer_i + 1), z_end)
+
+        prev_pt = [entry_x, entry_y, safe_z if layer_i == 0 else z + step_down]
+        segments.append({"type": "G1", "from": list(prev_pt), "to": [entry_x, entry_y, z]})
+        gcode.append(f"G1 X{entry_x:.3f} Y{entry_y:.3f} Z{z:.3f} F{plunge_feed:.0f}")
+
+        contour = _pocket_contour_points(cx, cy, offset_x, offset_y, corner_r)
+
+        prev = [entry_x, entry_y, z]
+        for seg in contour:
+            if seg["type"] == "G1":
+                to_pt = [seg["x"], seg["y"], z]
+                segments.append({"type": "G1", "from": list(prev), "to": list(to_pt)})
+                gcode.append(f"G1 X{seg['x']:.3f} Y{seg['y']:.3f} F{feed:.0f}")
+                prev = to_pt
+            elif seg["type"] in ("G2", "G3"):
+                to_pt = [seg["x"], seg["y"], z]
+                segments.append({
+                    "type": seg["type"], "from": list(prev), "to": list(to_pt),
+                    "center": [seg["cx"], seg["cy"], z], "radius": corner_r,
+                })
+                gcode.append(
+                    f"{seg['type']} X{seg['x']:.3f} Y{seg['y']:.3f} "
+                    f"I{seg['cx'] - prev[0]:.3f} J{seg['cy'] - prev[1]:.3f} F{feed:.0f}"
+                )
+                prev = to_pt
+
+    segments.append({"type": "G0", "from": list(prev), "to": [entry_x, entry_y, safe_z]})
+    gcode.append(f"G0 Z{safe_z:.3f}")
+
+    return segments, gcode
+
+
+def _pocket_contour_points(
+    cx: float, cy: float, ox: float, oy: float, r: float,
+) -> list[dict[str, Any]]:
+    """Generate a closed rectangular contour with rounded corners (CW = G2).
+    Starting point: bottom-right straight edge start."""
+    pts: list[dict[str, Any]] = []
+
+    pts.append({"type": "G1", "x": cx + ox, "y": cy - oy + r})
+    pts.append({"type": "G2", "x": cx + ox - r, "y": cy + oy, "cx": cx + ox - r, "cy": cy + oy - r})
+
+    pts.append({"type": "G1", "x": cx - ox + r, "y": cy + oy})
+    pts.append({"type": "G2", "x": cx - ox, "y": cy + oy - r, "cx": cx - ox + r, "cy": cy + oy - r})
+
+    pts.append({"type": "G1", "x": cx - ox, "y": cy - oy + r})
+    pts.append({"type": "G2", "x": cx - ox + r, "y": cy - oy, "cx": cx - ox + r, "cy": cy - oy + r})
+
+    pts.append({"type": "G1", "x": cx + ox - r, "y": cy - oy})
+    pts.append({"type": "G2", "x": cx + ox, "y": cy - oy + r, "cx": cx + ox - r, "cy": cy - oy + r})
+
+    return pts
+
+
+# ---------------------------------------------------------------------------
+# Stock & section geometry
+# ---------------------------------------------------------------------------
+
 def _compute_stock(part_bounds: np.ndarray, margin_xy: float = 3.0, margin_z: float = 3.0) -> np.ndarray:
     stock_min = part_bounds[0].copy()
     stock_max = part_bounds[1].copy()
@@ -338,6 +746,7 @@ def _compute_removal_regions(
     stock_bounds: np.ndarray,
     cut_plane_z: float,
     tool_radius: float,
+    part_section_override: BaseGeometry | None = None,
 ) -> BaseGeometry:
     stock_polygon = box(
         float(stock_bounds[0][0]),
@@ -348,7 +757,11 @@ def _compute_removal_regions(
     if stock_polygon.is_empty:
         return GeometryCollection()
 
-    part_section = _extract_section_geometry(mesh, cut_plane_z)
+    if part_section_override is not None:
+        part_section = part_section_override
+    else:
+        part_section = _extract_section_geometry(mesh, cut_plane_z)
+
     if part_section.is_empty:
         return stock_polygon
 
@@ -359,10 +772,14 @@ def _compute_removal_regions(
 def _extract_section_geometry(mesh: trimesh.Trimesh, cut_plane_z: float) -> BaseGeometry:
     z_min = float(mesh.bounds[0][2])
     z_max = float(mesh.bounds[1][2])
-    if cut_plane_z >= z_max - 1e-6 or cut_plane_z <= z_min + 1e-6:
+    if cut_plane_z >= z_max - 1e-6:
         return GeometryCollection()
+    if cut_plane_z < z_min:
+        return GeometryCollection()
+    effective_z = max(cut_plane_z, z_min + 0.05)
+    effective_z = min(effective_z, z_max - 0.05)
     section = mesh.section(
-        plane_origin=np.array([0.0, 0.0, cut_plane_z], dtype=float),
+        plane_origin=np.array([0.0, 0.0, effective_z], dtype=float),
         plane_normal=np.array([0.0, 0.0, 1.0], dtype=float),
     )
     if section is None:
@@ -378,8 +795,6 @@ def _extract_section_geometry(mesh: trimesh.Trimesh, cut_plane_z: float) -> Base
         return GeometryCollection()
     merged = unary_union(polygons)
 
-    # to_planar() centres coordinates on the section centroid.
-    # Apply the to_3D affine (rotation + translation) to restore mesh-frame x,y.
     a, b = float(to_3d[0, 0]), float(to_3d[0, 1])
     d, e = float(to_3d[1, 0]), float(to_3d[1, 1])
     dx, dy = float(to_3d[0, 3]), float(to_3d[1, 3])
@@ -398,6 +813,10 @@ def _clean_geometry(geometry: BaseGeometry) -> BaseGeometry:
         return GeometryCollection()
     return cleaned
 
+
+# ---------------------------------------------------------------------------
+# Scan-line helpers
+# ---------------------------------------------------------------------------
 
 def _build_layer_scan_segments(removal_geometry: BaseGeometry, step_over: float) -> list[tuple[tuple[float, float], tuple[float, float]]]:
     if removal_geometry.is_empty:
@@ -456,73 +875,42 @@ def _iter_line_geometries(geometry: BaseGeometry) -> list[LineString]:
     return []
 
 
+# ---------------------------------------------------------------------------
+# Fallback & utilities
+# ---------------------------------------------------------------------------
+
 def _generate_bbox_fallback(inputs: CamInputs, stock_bounds: np.ndarray, strategy: str) -> dict[str, Any]:
-    step_over = max(inputs.tool_diameter * inputs.step_over_ratio, 0.1)
-    tool_radius = max(inputs.tool_diameter * 0.5, 0.1)
-    stock_height = float(stock_bounds[1][2] - stock_bounds[0][2])
-    num_layers = max(1, math.ceil(stock_height / max(inputs.step_down, 0.1)))
+    """Safe fallback: return empty toolpath with warning instead of cutting through the part."""
     extents = stock_bounds[1] - stock_bounds[0]
-    stock_polygon = box(
-        float(stock_bounds[0][0]),
-        float(stock_bounds[0][1]),
-        float(stock_bounds[1][0]),
-        float(stock_bounds[1][1]),
-    ).buffer(-tool_radius)
-
-    gcode_lines = [
-        f"(Cloud CAM Generated for Job {inputs.job_id})",
-        f"(Model: {float(extents[0]):.1f} x {float(extents[1]):.1f} x {float(extents[2]):.1f} mm)",
-        f"(Params: step_down={inputs.step_down} spindle={inputs.spindle_speed} feed={inputs.feed_rate})",
-        f"(Strategy: {strategy})",
-        "G21 (metric)",
-        "G90 (absolute)",
-        f"S{inputs.spindle_speed} M3",
-        f"G0 Z{inputs.safe_z}",
-    ]
-
-    toolpath_segments: list[dict[str, Any]] = []
-    prev = [0.0, 0.0, inputs.safe_z]
-
-    for layer in range(num_layers):
-        cut_depth = -min(inputs.step_down * (layer + 1), stock_height)
-        scan_segments = _build_layer_scan_segments(stock_polygon, step_over)
-        for start, end in scan_segments:
-            toolpath_segments.append({"type": "G0", "from": list(prev), "to": [start[0], start[1], inputs.safe_z]})
-            gcode_lines.append(f"G0 X{start[0]:.3f} Y{start[1]:.3f} Z{inputs.safe_z:.3f}")
-            prev = [start[0], start[1], inputs.safe_z]
-
-            toolpath_segments.append({"type": "G1", "from": list(prev), "to": [start[0], start[1], cut_depth]})
-            gcode_lines.append(f"G1 Z{cut_depth:.3f} F{inputs.feed_rate * 0.5:.0f}")
-            prev = [start[0], start[1], cut_depth]
-
-            toolpath_segments.append({"type": "G1", "from": list(prev), "to": [end[0], end[1], cut_depth]})
-            gcode_lines.append(f"G1 X{end[0]:.3f} Y{end[1]:.3f} F{inputs.feed_rate:.0f}")
-            prev = [end[0], end[1], cut_depth]
-
-            toolpath_segments.append({"type": "G0", "from": list(prev), "to": [end[0], end[1], inputs.safe_z]})
-            gcode_lines.append(f"G0 Z{inputs.safe_z:.3f}")
-            prev = [end[0], end[1], inputs.safe_z]
-
-    toolpath_segments.append({"type": "G0", "from": list(prev), "to": [0.0, 0.0, inputs.safe_z]})
-    gcode_lines.extend(["G0 X0 Y0", "M5", "M30"])
-
-    total_cut_len = _cutting_length(toolpath_segments)
-
+    gcode_lines = _gcode_header(inputs, extents)
+    gcode_lines.extend([
+        f"(Strategy: {strategy} — stock margin too narrow for selected tool)",
+        "M5",
+        "M30",
+    ])
     return {
         "gcode_lines": gcode_lines,
-        "toolpath_segments": toolpath_segments,
-        "estimated_time_minutes": round(total_cut_len / inputs.feed_rate, 1) if inputs.feed_rate > 0 else 0,
+        "toolpath_segments": [],
+        "estimated_time_minutes": 0,
         "stats": {
-            "layers": num_layers,
-            "total_cut_length_mm": round(total_cut_len, 1),
+            "layers": 0,
+            "total_cut_length_mm": 0,
             "strategy": strategy,
+            "warning": "刀具直径大于毛坯余量，无法生成安全刀路。请选用更小的刀具或增大毛坯余量。",
         },
     }
 
 
 def _cutting_length(toolpath_segments: list[dict[str, Any]]) -> float:
-    return sum(
-        math.sqrt(sum((b - a) ** 2 for a, b in zip(seg["from"], seg["to"])))
-        for seg in toolpath_segments
-        if seg["type"] == "G1"
-    )
+    total = 0.0
+    for seg in toolpath_segments:
+        if seg["type"] in ("G1", "G2", "G3"):
+            if seg["type"] == "G1":
+                total += math.sqrt(sum((b - a) ** 2 for a, b in zip(seg["from"], seg["to"])))
+            else:
+                r = seg.get("radius", 0)
+                if r > 0:
+                    total += math.pi * r
+                else:
+                    total += math.sqrt(sum((b - a) ** 2 for a, b in zip(seg["from"], seg["to"])))
+    return total
