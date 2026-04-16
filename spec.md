@@ -1,6 +1,6 @@
 # Cloud CAM 工业级云端加工管理平台系统规范 (Spec)
 
-> **最后更新**: 2026-04-14
+> **最后更新**: 2026-04-16 (v2 — 装夹面高亮/刀路坐标修正)
 
 ## 0. 关联文档
 
@@ -27,8 +27,8 @@
 * **多模式工具栏**: 3D 预览区左上角悬浮工具栏，支持三种交互模式：
   * **旋转/平移** (Orbit): 鼠标拖拽旋转、右键平移、滚轮缩放。**所有模式下始终可用**。
   * **测量** (Measure): 在模型表面点击两点，自动计算并显示距离 (mm)，带端点标记和中点标签。
-  * **选择装夹面** (Face Select): 点击模型表面选择 CNC 装夹底面，显示半透明橙色圆盘和黄色法向箭头。
-* **刀路可视化叠加**: 生成 G-Code 后，3D 场景自动叠加显示刀路：
+  * **选择装夹面** (Face Select): 点击模型表面选择 CNC 装夹底面。使用 **BFS 洪泛算法** 从点击三角形出发搜索所有共面三角形（法向偏差 <5°），生成贴合实际模型曲面的半透明橙色高亮网格，箭头指示加工 Z 轴方向（装夹面法向的反方向）。
+* **刀路可视化叠加**: 生成 G-Code 后，3D 场景自动叠加显示刀路，刀路坐标经后端逆变换回模型原始坐标系，与模型精确对齐：
   * 红色线段 = G0 快速移动（非切削）
   * 青色线段 = G1 切削进给
   * 绿色球 = 起点，红色球 = 终点
@@ -42,7 +42,9 @@
 * **当前作业概览** (新增): 显示当前作业文件名、状态（已上传/解析中/生成中/已完成/失败）、进度条、错误提示；支持 Mock 降级状态标注。
 * **最近作业列表** (新增): 显示最近 8 个作业历史，支持点击恢复任意历史作业，显示阶段、进度、错误信息，带刷新按钮。
 * **模型特征卡片**: 显示体积、XY 尺寸、最大 Z 深度。
+* **加工特征识别卡片**: 显示识别到的制造特征（孔、型腔、凸台）及其参数（直径/深度/范围），支持特征类型汇总统计。
 * **工艺参数面板**: 显示专家推荐参数（背吃刀量、主轴转速、进给率），**用户可编辑覆写**。标注"专家推荐"或"默认值"来源。
+* **刀具选配方案卡片**: 显示自动选配的粗加工刀具和各特征对应的精加工刀具，含选刀理由。
 * **G-Code 结果卡片**: 显示预计加工时间、加工层数、切削总长度，提供 `.nc` 文件下载。
 * **生成按钮**: 底部固定，带加载状态和禁用逻辑。
 
@@ -50,7 +52,7 @@
 | 文件路径 | 职责 |
 | :--- | :--- |
 | `src/App.tsx` | 主应用：状态管理、上传/生成流程、侧边栏 UI、工具栏、**作业列表与恢复** (新增) |
-| `src/components/ModelViewer.tsx` | 3D 模型渲染：OBJ/STL/GLB 加载、面拾取、测量、刀路叠加；已修复未使用参数 |
+| `src/components/ModelViewer.tsx` | 3D 模型渲染：OBJ/STL/GLB 加载、**共面洪泛面高亮**、测量、刀路叠加（模型坐标系直接渲染） |
 | `src/components/ToolpathViewer.tsx` | 刀路 3D 可视化：G0/G1 分色线段、起止标记；已修正 bufferAttribute 类型 |
 | `src/components/ErrorBoundary.tsx` | React 错误边界，捕获 3D 渲染崩溃 |
 | `src/App.css` | 自定义滚动条样式 |
@@ -70,13 +72,14 @@
 | :--- | :--- | :--- |
 | `/api/v1/upload/` | POST | **[v1 同步主链]** 上传 STEP → CadQuery 进程内解析 → STL/OBJ + topology.json 落盘 → 返回渲染 URL + 拓扑与状态字段 |
 | `/api/v1/craftsman/recommend/` | GET | 输入 volume + max_depth → 欧氏距离最近邻 → 返回推荐工艺参数 |
-| `/api/v1/cam/generate/` | POST | **[v1 同步主链]** 输入工艺参数 + 模型 bbox → OpenCAMLib Drop-cutter (自动降级) → cam_result.json 落盘 → 返回 G-Code URL + 刀路分段 |
+| `/api/v1/cam/tools/` | GET | 返回内置刀具库（D2–D8 平底铣刀，6 把） |
+| `/api/v1/cam/generate/` | POST | **[v1 同步主链]** 读取已识别特征 → 自动选刀 → 用选出的粗加工刀径生成 stock-aware 刀路 → cam_result.json 落盘 → 返回 G-Code URL + 刀路分段 + 刀具方案 |
 | `/api/v1/jobs/recent` | GET | **[内部查询]** 返回最近 12 个作业摘要（文件名、状态、阶段、时间戳） |
 | `/api/v1/jobs/{job_id}` | GET | **[内部查询]** 返回单个作业完整信息（拓扑、CAM 结果、渲染 URL、错误信息、时间戳） |
-| `/api/v2/jobs/` | POST | **[异步可选]** 提交异步解析任务，返回 job_id |
-| `/api/v2/jobs/{job_id}` | GET | **[异步可选]** 查询异步任务状态 |
-| `/api/v2/jobs/{job_id}/cam` | POST | **[异步可选]** 异步提交 CAM 生成任务 |
-| `/api/v2/jobs/{job_id}/artifacts` | GET | **[异步可选]** 查询异步任务产物（拓扑、CAM 结果、渲染文件） |
+| `/api/v2/jobs/` | POST | **[v2 同步]** 提交解析任务，返回 job_id 和解析结果 |
+| `/api/v2/jobs/{job_id}` | GET | **[v2 同步]** 查询任务状态和产物 |
+| `/api/v2/jobs/{job_id}/cam` | POST | **[v2 同步]** 提交 CAM 生成任务 |
+| `/api/v2/jobs/{job_id}/artifacts` | GET | **[v2 同步]** 查询渲染/刀路产物与统计信息 |
 
 #### 2.2.2 后端关键文件
 | 文件路径 | 职责 |
@@ -85,35 +88,53 @@
 | `database.py` | SQLAlchemy 引擎、Session 管理、轻量自愈迁移 (`ensure_jobs_columns`) |
 | `models.py` | ORM 模型定义 (Job 含 stage/progress/error_code, CAMRecord, ToolCard) |
 | `routers/upload.py` | **v1 同步**: 文件校验、CadQuery 解析、Mock 降级、状态落盘、JSON 写入 |
-| `routers/cam.py` | **v1 同步**: OpenCAMLib 刀路 + 降级策略 + G-Code + 状态落盘 |
+| `routers/cam.py` | **v1 同步**: 读取特征 → 自动选刀 → CAM 生成 + G-Code + 刀具方案落盘 |
 | `routers/craftsman.py` | 专家推荐：Min-Max 归一化 + 加权欧氏距离 |
 | `routers/internal_jobs.py` | **内部查询**: recent 列表与 detail 接口，支持恢复历史作业 |
-| `routers/jobs.py` | **v2 异步** (可选): Celery 任务提交与状态查询 |
-| `services/geometry_engine.py` | CadQuery STEP 进程内解析、特征提取、STL/GLB 导出 |
-| `services/cam_engine.py` | OpenCAMLib 适配层（Drop-cutter + 平面粗加工降级） |
-| `celery_app.py` | **异步可选**: Celery 配置 (Redis broker) |
-| `tasks.py` | **异步可选**: parse_step_task / generate_cam_task 异步任务定义 |
+| `routers/jobs.py` | **v2 同步**: 任务提交与状态查询（已简化为同步处理） |
+| `services/geometry_engine.py` | CadQuery STEP 解析、制造特征识别（孔/型腔/凸台）、STL/GLB 导出 |
+| `services/cam_engine.py` | Stock-aware CAM 引擎：毛坯计算 + 截面差集 + 扫描线生成 + 内置刀具库 + 自动选刀 + **刀路坐标逆变换回模型空间** |
+| `tasks.py` | 同步任务函数：parse_step_task / generate_cam_task |
 
 ### 2.3 底层几何与 CAM 引擎池
 
-#### 2.3.1 几何解析 (CadQuery/OpenCASCADE)
+#### 2.3.1 几何解析与特征识别 (CadQuery/OpenCASCADE)
 * 后端进程内直接完成 STEP/B-Rep 读取，无 FreeCAD 外部 subprocess 依赖
 * 主要能力：
   * B-Rep STEP 装配体导入解析
   * 面 (Face) 级法向量提取（通过 `ParameterRange` UV 中点获取，兼容平面/圆柱/锥面等所有面类型）
   * 面质心与边界点收集
   * 包围盒 (BoundBox) 和体积 (Volume) 特征提取
+  * **制造特征识别** (`_recognize_features`):
+    * **孔 (hole)**: 圆柱面 + 中心低于零件顶面 → 提取直径、深度、轴向
+    * **凸台 (boss)**: 圆柱面中心位于零件顶面附近，或小于零件顶面面积的平面
+    * **型腔 (pocket)**: 法向朝上的平面 + 低于零件顶面 → 提取深度、XY 范围、面积
   * 三角化网格导出 STL (精度 0.1mm)
   * 尝试 GLB/GLTF 导出（失败自动回退 STL）
 * Mock 降级: CadQuery 不可用时，生成基于 bbox 的方盒 OBJ + 6 面拓扑
 
-#### 2.3.2 CAM 规划 (OpenCAMLib + Fallback)
-* 优先使用 **OpenCAMLib (C++ Python 绑定)** 进行 3D Drop-cutter 刀位计算
-* 运行时策略：
-  * **第一层**: 尝试 OpenCAMLib Drop-cutter（若环境可用）
-  * **第二层**: 自动降级到平面粗加工策略（分层开粗 + zigzag 扫描）
-* 接口契约始终一致：返回刀路分段 (G0/G1) 和 G-Code
-* OpenCAMLib 设计为**运行时可选增强**，非硬依赖
+#### 2.3.2 CAM 规划 (Stock-aware Roughing + OpenCAMLib Optional)
+* **Stock-aware 粗加工** (默认策略):
+  1. **毛坯计算**: 模型包围盒各方向外扩 3mm (`_compute_stock`)
+  2. **逐层切片**: 从毛坯顶面向下，按 `step_down` 分层
+  3. **截面差集**: 每层用 trimesh 截取零件截面 → shapely 2D 差集 (stock - part) 得出去除区域
+  4. **扫描线填充**: 在去除区域内生成 zigzag 扫描路径
+  5. **坐标还原**: 利用 `to_planar()` 返回的 `to_3D` 仿射矩阵还原截面坐标到网格空间
+* **坐标变换管线** (装夹面 → 模型空间):
+  1. `_load_prepared_mesh`: 加载网格 → 按装夹面法向旋转 (setup_normal → (0,0,-1)) → 平移到原点 → 记录正向变换矩阵 `forward = T @ R`，计算逆矩阵 `inverse = forward⁻¹`
+  2. 刀路生成：在 prepared 坐标系下生成 (XY 为 prepared 坐标，Z 为 G-code 机床坐标 Z=0 在零件顶面)
+  3. `_segments_machine_z_to_prepared`: 将 Z 从机床坐标系转换到 prepared 坐标系 (`z += part_top_z`)
+  4. `_transform_segments_to_model_space`: 应用逆矩阵将 prepared 坐标还原到原始模型坐标系
+  5. 前端接收到模型空间坐标，直接与模型同组渲染，无需额外变换
+* **Z 轴约定**: 选定装夹面后，加工 Z 轴 = 装夹面法向的反方向 (面朝下放置，刀具从上方加工)
+* **内置刀具库** (6 把): D2/D3/D4/D5/D6/D8 平底铣刀
+* **自动选刀**: 根据识别到的制造特征自动选配刀具
+  * 粗加工: 不超过零件最窄边 50% 的最大刀
+  * 孔: 不超过孔径 80% 的最大刀
+  * 型腔: 不超过最窄边 60% 的最大刀
+  * 凸台: 沿用粗加工刀
+* **OpenCAMLib**: 仍为运行时可选增强，当前默认走 stock-aware 粗加工
+* 接口契约始终一致：返回刀路分段 (G0/G1, 模型空间坐标) + G-Code (机床坐标) + 刀具方案
 
 ---
 
@@ -139,21 +160,28 @@
 模型拓扑入库后，`craftsman.py` 接收工件体积 (volume) 和最大深度 (max_depth)。采用 **Min-Max 归一化** 消除量纲差异，配合可配置权重 (volume: 0.6, depth: 0.4) 计算加权欧氏距离，返回最近邻历史案例的工艺参数。无历史数据时返回安全默认值并标记 `is_guessed`。
 
 ### 3.3 下行生成流 (Toolpath & G-Code Generation / v1 同步主链)
-1. 前端传入用户工艺参数 + 模型真实 bbox 尺寸
-2. 后端 `cam.py` 寻找可用网格 (STL/OBJ)
-3. 调用 `cam_engine.generate_cam_with_ocl()`：
-   - **优先**: OpenCAMLib Drop-cutter 3D 刀位计算
-   - **降级**: 平面粗加工（分层开粗 + zigzag 扫描）
-4. 产出：
-   - **刀路分段** (G0 快速移动/G1 切削) 供前端 3D 可视化
-   - **G-Code 文件** (.nc) 落盘 + 返回 URL
+1. 前端传入用户工艺参数 + 模型真实 bbox 尺寸 + 可选装夹面
+2. 后端 `cam.py` 读取 `topology.json` 中的制造特征
+3. **自动选刀**: `select_tools_for_features()` 根据特征类型和尺寸从内置刀具库选配粗加工刀和特征精加工刀
+4. 寻找可用网格 (STL/OBJ)，用选出的粗加工刀径调用 `cam_engine.generate_cam_with_ocl()`：
+   - 加载网格 → 按装夹面法向旋转 (→ Z 朝下) → 平移到原点 → 记录正向/逆变换矩阵
+   - 计算毛坯（模型各向外扩 3mm）
+   - 从毛坯顶面逐层向下切片
+   - 每层：trimesh 截面 → `to_planar()` + 仿射还原 → shapely 差集 → 扫描线填充
+   - 刀路 Z 坐标从 G-code 机床系 (Z=0 在零件顶面) 转换到 prepared 绝对坐标系
+   - 应用逆变换矩阵将刀路坐标还原到原始模型坐标系
+   - OpenCAMLib 可用时优先使用，否则自动降级
+5. 产出：
+   - **刀路分段** (G0 快速移动/G1 切削, **模型坐标系**) 供前端 3D 可视化直接叠加
+   - **G-Code 文件** (.nc, **机床坐标系**) 落盘 + 返回 URL
+   - **刀具选配方案** (roughing_tool + feature_tools) 含选刀理由
    - **加工时间估算** (基于切削总长 / 进给率)
-   - **统计信息** (点数、分段数) 写入 `cam_result.json`
-5. Job 状态：`uploaded` → `generating` → `done` (或 → `failed`)
-6. 前端恢复功能：后续页面刷新或点击"最近作业"可重新打开本次结果
+   - **统计信息** (层数、切削总长、毛坯尺寸) 写入 `cam_result.json`
+6. Job 状态：`uploaded` → `generating` → `done` (或 → `failed`)
+7. 前端恢复功能：后续页面刷新或点击"最近作业"可重新打开本次结果
 
 **错误处理**:
-- OpenCAMLib 运行时错误 → 自动降级为平面粗加工（无需前端感知）
+- OpenCAMLib 运行时错误 → 自动降级为 stock-aware 粗加工（无需前端感知）
 - 网格缺失 → 返回 E3001 错误
 - 其他异常 → 记录 error_code/error_message，前端展示并支持调试
 
@@ -177,8 +205,7 @@ CNC/
 │   │   ├── __init__.py            # 
 │   │   ├── geometry_engine.py     # CadQuery STEP 解析 + STL/GLB 导出
 │   │   └── cam_engine.py          # OpenCAMLib 适配 + 降级策略
-│   ├── celery_app.py              # Celery 配置 (可选)
-│   ├── tasks.py                   # 异步任务定义 (可选)
+│   ├── tasks.py                   # 同步任务函数
 │   ├── utils/
 │   │   └── __init__.py            # 
 │   └── uploads/                   # 上传文件 + 产物目录 (job_id/)
@@ -202,53 +229,63 @@ CNC/
 
 ## 5. 启动方式
 
-### 5.1 后端 (v1 同步主流程)
+### 5.1 前置条件
+* **Conda 环境**: `data`（Python 3.12，已包含 CadQuery/trimesh/shapely 等依赖）
+* **Node.js**: ≥18（前端构建）
+* 无需 Redis/Celery/Docker/PostgreSQL 等外部服务
+
+### 5.2 后端
 ```bash
-# 激活虚拟环境
-conda activate <your_env>   # 需要安装 requirements.txt
+# 1. 激活 conda 环境
+conda activate data
+
+# 2. 安装依赖（首次或依赖变更后）
 cd backend
+pip install -r requirements.txt
 
-# 方式 1: 开发环境 (自动重载)
-C:/path/to/python.exe -m uvicorn main:app --reload --host 0.0.0.0 --port 8000
+# 3. 启动开发服务器（自动重载）
+python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000
 
-# 方式 2: 无外部依赖 (仅 SQLite)
-# 无需 Redis/Celery 配置，v1 同步链路完全自洽
+# 后端地址: http://localhost:8000
+# 健康检查: http://localhost:8000/  → {"status":"ok","message":"Cloud CAM API is running"}
 ```
 
 **环境变量** (可选):
 ```bash
-# SQLite (默认)
-DATABASE_URL=sqlite:///./cloudcam.db
-
-# 或 PostgreSQL (生产)
-DATABASE_URL=postgresql://user:pass@localhost/cloudcam
-DB_POOL_SIZE=10
-DB_MAX_OVERFLOW=20
+DATABASE_URL=sqlite:///./cloudcam.db   # 默认 SQLite，无需配置
 ```
 
-### 5.2 前端
+### 5.3 前端
 ```bash
 cd frontend
+
+# 1. 安装依赖（首次或依赖变更后）
 npm install
 
-# 开发环境
-npx vite --host 0.0.0.0 --port 5173
+# 2. 启动开发服务器
+npm run dev
 
-# 访问
-# 本地: http://localhost:5173/
-# 同网段: http://<network-ip>:5173/
+# 前端地址: http://localhost:5173/
+# API 代理配置: frontend/.env → VITE_API_BASE_URL=http://localhost:8000
 ```
 
-### 5.3 异步支持 (可选，当前内部不需要)
+### 5.4 一键启动（两个终端）
 ```bash
-# 启动 Redis
-docker run -d -p 6379:6379 redis:latest
+# 终端 1 — 后端
+conda activate data && cd backend && python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000
 
-# 启动 Celery Worker
-celery -A celery_app worker --loglevel=info
-
-# Backend 会自动识别并使用异步链路 (/api/v2/jobs)
+# 终端 2 — 前端
+cd frontend && npm run dev
 ```
+
+### 5.5 架构说明
+当前采用简化的同步处理架构：
+- 所有 STEP 解析和 G-Code 生成均为同步处理
+- 数据库使用 SQLite，零配置
+- 无需 Redis/Celery/Docker 等外部依赖
+- 适合开发测试和单用户/低并发场景
+
+如需高并发支持，可参考 `rfc-saas-industrialization.md` 中的 SaaS 工业化方案。
 
 ---
 
@@ -266,6 +303,16 @@ celery -A celery_app worker --loglevel=info
 | **Three Fiber bufferAttribute 类型** | `ToolpathViewer.tsx` 用旧语法 `array/count/itemSize` 属性，与最新 react-three-fiber 不兼容。 | 改为 `args={[array, itemSize]}` 标准化语法。 |
 | **未使用参数编译警告** | TypeScript 严格模式启用 `noUnusedParameters`，但个别组件传入未用到的参数。 | 清理 `ModelViewer.tsx` 中 `InteractiveModel` 的未使用参数 (`selectedFace`/`measurePoints`)。 |
 | **OpenCAMLib 平台兼容性** | Windows/Python 版本差异导致 OCL 安装失败。 | 将 OpenCAMLib 从硬依赖改为运行时可选增强，装不上时自动降级到平面粗加工，接口契约不变。 |
+| **刀路不覆盖模型 (全面加工缺失)** | 旧版 CAM 引擎对整个 bbox 做 zigzag 扫描，不区分毛坯和零件实体，导致加工掉零件本身。 | 重构为 stock-aware 架构：毛坯外扩 3mm → trimesh 截面 → shapely 差集 (stock - part) → 仅在去除区域生成扫描线。 |
+| **毛坯无 Z 方向余量** | `_compute_stock` 只在 XY 加余量，Z 方向毛坯顶面 = 零件顶面，导致每层截面差集只剩周边窄环。 | 毛坯 Z 顶面增加 3mm 余量。首层切面在零件上方 → 截面为空 → 差集 = 整个毛坯 → 全面积覆盖加工。 |
+| **截面 Z 超界钳位错误** | `_extract_section_geometry` 把超出零件的 Z 钳位回顶面，导致即使有 Z 余量仍返回实体截面。 | 超出零件边界直接返回空截面，表示该层全为需去除材料。 |
+| **`to_planar()` 坐标偏移** | trimesh `to_planar()` 以截面质心为原点平移 2D 坐标，导致截面多边形与毛坯坐标系不匹配，刀路飘离模型。 | 利用 `to_planar()` 返回的 `to_3D` 仿射矩阵，通过 `shapely.affinity.affine_transform` 还原截面坐标到网格空间。 |
+| **缺少制造特征识别** | 几何引擎只提取面法向和 bbox，无法识别孔、型腔、凸台等加工特征。 | 新增 `_recognize_features()`：遍历 CadQuery 面，按几何类型 (CYLINDER/PLANE)、法向、Z 位置、面积等启发式规则分类。 |
+| **单一刀具硬编码** | CAM 路由硬编码 `TOOL_DIAMETER = 6.0`，不区分特征类型。 | 内置 D2–D8 刀具库 + `select_tools_for_features()` 自动选刀，粗加工用最大可用刀，特征按尺寸约束选配。 |
+| **装夹面高亮不贴合模型** | 旧版 FaceHighlight 用固定大小的浮动圆盘，无法适配实际 B-Rep 面形状。 | BFS 洪泛算法 (`collectCoplanarFaceIndices`) 从点击三角形出发搜索所有共面三角形 (法向偏差 <5°, 上限 50000)，`buildHighlightGeometry` 构建贴合网格曲面的高亮几何体，使用 `polygonOffset` 防 Z-fighting。 |
+| **刀路与模型坐标系不对齐** | 后端生成刀路时先旋转+平移网格到 prepared 坐标系，但刀路坐标未还原回原始模型空间，导致前端渲染时刀路偏移模型。 | `_load_prepared_mesh` 记录正向变换矩阵并计算逆矩阵；`_transform_segments_to_model_space` 将刀路坐标逆变换回原始模型空间，前端直接与模型同组渲染。 |
+| **刀路 Z 坐标混用导致偏移** | 刀路 XY 使用 prepared 绝对坐标，但 Z 使用 G-code 机床坐标 (Z=0 在零件顶面)，逆变换时混合坐标系导致 Z 方向严重偏移。 | 新增 `_segments_machine_z_to_prepared`：在逆变换前将 Z 从机床坐标转为 prepared 绝对坐标 (`z += part_top_z`)，确保 XYZ 三轴统一在 prepared 坐标系下再做逆变换。 |
+| **装夹面箭头方向错误** | 面高亮箭头指向面法向方向，但 CNC 约定加工 Z 轴 = 装夹面法向的反方向。 | 箭头方向改为 `normal.negate()`，指示加工 Z 轴方向（刀具进入方向）。 |
 
 ---
 
@@ -290,13 +337,11 @@ celery -A celery_app worker --loglevel=info
 | Uvicorn | 0.44 | ASGI 服务器 |
 | SQLAlchemy | ≥2.0 | ORM |
 | SQLite | Latest | 默认数据库（可切 PostgreSQL） |
-| CadQuery | Latest | OpenCASCADE Python 绑定，STEP 解析 |
-| trimesh | Latest | |
+| CadQuery | Latest | OpenCASCADE Python 绑定，STEP 解析 + 特征识别 |
+| trimesh | Latest | 网格加载、截面切片 |
+| shapely | ≥2.1 | 2D 几何运算（差集、扫描线交集） |
+| networkx | ≥3.6 | trimesh 间接依赖（空间图计算） |
+| rtree | ≥1.4 | trimesh 间接依赖（空间索引） |
 | OpenCAMLib | Optional | CAM 规划（运行时可选，失败自动降级） |
-| **异步可选** | | 内部当前不需要 |
-| Celery | Latest | 任务队列框架 |
-| Redis | Latest | Celery Broker |
-| psycopg[binary] | Latest | PostgreSQL 驱动 |
-| **Docker (可选)** | | |
-| Python | 3.12 | Backend 容器基镜像 |
-| Node | Latest | Frontend 构建容器 |
+
+> 注：当前采用简化架构，Conda 环境 `data`，无需 Redis/Celery/Docker。如需生产级高并发部署，可参考 `rfc-saas-industrialization.md`。

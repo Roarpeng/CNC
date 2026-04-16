@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import axios from 'axios';
-import { UploadCloud, Settings, Play, Download, AlertTriangle, Box, Ruler, Layers, CheckCircle2, Loader2, Move3d, Crosshair, Eye, EyeOff, RotateCw, FolderClock } from 'lucide-react';
+import { UploadCloud, Settings, Play, Download, AlertTriangle, Box, Ruler, Layers, CheckCircle2, Loader2, Move3d, Crosshair, Eye, EyeOff, RotateCw, FolderClock, Wrench } from 'lucide-react';
 import type { InteractionMode, SelectedFace, MeasureResult } from './components/ModelViewer';
 import type { ToolpathSegment } from './components/ToolpathViewer';
 import ModelViewer from './components/ModelViewer';
@@ -29,6 +29,41 @@ type JobSnapshot = {
   } | null;
   created_at?: string;
   updated_at?: string;
+};
+
+type ManufacturingFeature = {
+  type: string;
+  surface?: string;
+  face_id?: number;
+  diameter?: number;
+  depth?: number;
+  height?: number;
+  area?: number;
+  axis?: string;
+  bounds?: { x?: number; y?: number };
+};
+
+type ToolInfo = {
+  id: number;
+  diameter: number;
+  name: string;
+  type: string;
+  flutes?: number;
+};
+
+type FeatureToolEntry = {
+  feature_type: string;
+  feature_face_id?: number;
+  diameter?: number;
+  depth?: number;
+  bounds?: { x?: number; y?: number };
+  tool: ToolInfo | null;
+  reason: string;
+};
+
+type ToolPlan = {
+  roughing_tool: ToolInfo;
+  feature_tools: FeatureToolEntry[];
 };
 
 function mapJobStatus(status?: string): Status {
@@ -71,6 +106,15 @@ function formatJobTime(value?: string) {
   return date.toLocaleString('zh-CN', { hour12: false });
 }
 
+function formatFeatureType(type: string) {
+  switch (type) {
+    case 'hole': return '孔';
+    case 'pocket': return '型腔';
+    case 'boss': return '凸台';
+    default: return type;
+  }
+}
+
 function App() {
   const [file, setFile] = useState<File | null>(null);
   const [status, setStatus] = useState<Status>('idle');
@@ -88,6 +132,7 @@ function App() {
   const [measureResult, setMeasureResult] = useState<MeasureResult | null>(null);
   const [showToolpath, setShowToolpath] = useState(true);
   const [toolpathSegments, setToolpathSegments] = useState<ToolpathSegment[]>([]);
+  const [toolPlan, setToolPlan] = useState<ToolPlan | null>(null);
 
   // 可编辑的工艺参数 (由专家推荐初始化，用户可覆写)
   const [editParams, setEditParams] = useState({
@@ -125,6 +170,7 @@ function App() {
 
     setGcodeResult(restoredCam);
     setToolpathSegments(restoredCam?.toolpath_segments ?? []);
+    setToolPlan((job.cam_result as any)?.tool_plan ?? null);
     setSelectedFace(null);
     setMeasureResult(null);
   };
@@ -176,6 +222,7 @@ function App() {
     setModelData(null);
     setCurrentJob(null);
     setToolpathSegments([]);
+    setToolPlan(null);
 
     const formData = new FormData();
     formData.append('file', selectedFile);
@@ -235,10 +282,10 @@ function App() {
         } : null,
       });
       setGcodeResult(res.data);
-      // 解析刀路分段数据
       if (res.data.toolpath_segments) {
         setToolpathSegments(res.data.toolpath_segments);
       }
+      setToolPlan(res.data.tool_plan ?? null);
       setStatus('done');
       const nextJob: JobSnapshot = {
         ...(currentJob ?? {} as JobSnapshot),
@@ -266,6 +313,8 @@ function App() {
   };
 
   const features = modelData?.topology?.features;
+  const manufacturingFeatures = (modelData?.topology?.manufacturing_features ?? []) as ManufacturingFeature[];
+  const featureSummary = (modelData?.topology?.feature_summary ?? {}) as Record<string, number>;
   const currentProgress = currentJob?.progress ?? (status === 'done' ? 100 : status === 'uploaded' ? 100 : 0);
 
   return (
@@ -373,6 +422,59 @@ function App() {
             </div>
           )}
 
+          {features && (
+            <div className="bg-slate-900/60 rounded-lg border border-slate-700 p-4 space-y-3">
+              <div className="flex items-center justify-between gap-3">
+                <h3 className="text-xs font-semibold text-slate-400 uppercase tracking-wide">加工特征识别</h3>
+                <span className="text-[11px] text-slate-500">{manufacturingFeatures.length} 项</span>
+              </div>
+
+              {manufacturingFeatures.length > 0 && (
+                <div className="flex flex-wrap gap-2">
+                  {Object.entries(featureSummary).map(([key, value]) => (
+                    <span
+                      key={key}
+                      className="rounded-full border border-cyan-500/20 bg-cyan-950/30 px-2 py-1 text-[11px] text-cyan-300"
+                    >
+                      {formatFeatureType(key)} x {value}
+                    </span>
+                  ))}
+                </div>
+              )}
+
+              {manufacturingFeatures.length === 0 ? (
+                <div className="rounded-lg border border-dashed border-slate-700 px-3 py-3 text-xs text-slate-500">
+                  暂未识别到典型孔/型腔/凸台特征，当前仍可按外形粗加工生成刀路。
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {manufacturingFeatures.slice(0, 6).map((feature, index) => (
+                    <div key={`${feature.type}-${feature.face_id ?? index}`} className="rounded-lg border border-slate-800 bg-slate-950/40 px-3 py-2 text-xs">
+                      <div className="flex items-center justify-between gap-3">
+                        <span className="font-medium text-slate-200">{formatFeatureType(feature.type)}</span>
+                        <span className="text-slate-500">Face #{feature.face_id ?? '-'}</span>
+                      </div>
+                      <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-slate-400">
+                        {feature.diameter !== undefined && <span>直径: <span className="font-mono text-cyan-300">{feature.diameter.toFixed(2)} mm</span></span>}
+                        {feature.depth !== undefined && <span>深度: <span className="font-mono text-cyan-300">{feature.depth.toFixed(2)} mm</span></span>}
+                        {feature.height !== undefined && <span>高度: <span className="font-mono text-cyan-300">{feature.height.toFixed(2)} mm</span></span>}
+                        {feature.axis && <span>轴向: <span className="font-mono text-cyan-300 uppercase">{feature.axis}</span></span>}
+                        {feature.bounds?.x !== undefined && feature.bounds?.y !== undefined && (
+                          <span>范围: <span className="font-mono text-cyan-300">{feature.bounds.x.toFixed(2)} x {feature.bounds.y.toFixed(2)} mm</span></span>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                  {manufacturingFeatures.length > 6 && (
+                    <div className="text-[11px] text-slate-500">
+                      其余 {manufacturingFeatures.length - 6} 项已省略显示。
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+
           {/* 工艺参数面板 — 可编辑 */}
           {craftsmanParams && (
             <div className="space-y-3">
@@ -400,6 +502,46 @@ function App() {
               <ParamInput label="进给率 (Feed Rate)" unit="mm/min"
                 value={editParams.feed_rate}
                 onChange={v => setEditParams(p => ({ ...p, feed_rate: v }))} />
+            </div>
+          )}
+
+          {/* 刀具选配方案 */}
+          {toolPlan && (
+            <div className="bg-slate-900/60 rounded-lg border border-slate-700 p-4 space-y-3">
+              <div className="flex items-center gap-2">
+                <Wrench className="w-4 h-4 text-violet-400" />
+                <h3 className="text-xs font-semibold text-slate-400 uppercase tracking-wide">刀具选配方案</h3>
+              </div>
+
+              <div className="rounded-lg border border-violet-500/20 bg-violet-950/20 px-3 py-2 text-xs">
+                <div className="flex items-center justify-between">
+                  <span className="text-slate-400">粗加工刀具</span>
+                  <span className="font-mono text-violet-300 font-medium">{toolPlan.roughing_tool.name}</span>
+                </div>
+                <div className="flex items-center justify-between mt-1">
+                  <span className="text-slate-500">直径</span>
+                  <span className="font-mono text-violet-300">{toolPlan.roughing_tool.diameter} mm</span>
+                </div>
+              </div>
+
+              {toolPlan.feature_tools.length > 0 && (
+                <div className="space-y-2">
+                  <div className="text-[11px] text-slate-500">特征精加工刀具</div>
+                  {toolPlan.feature_tools.map((entry, idx) => (
+                    <div key={`ft-${entry.feature_face_id ?? idx}`} className="rounded-lg border border-slate-800 bg-slate-950/40 px-3 py-2 text-xs">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-slate-200 font-medium">{formatFeatureType(entry.feature_type)}</span>
+                        {entry.tool ? (
+                          <span className="font-mono text-cyan-300">D{entry.tool.diameter}</span>
+                        ) : (
+                          <span className="text-red-400">无匹配</span>
+                        )}
+                      </div>
+                      <div className="mt-1 text-slate-500">{entry.reason}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           )}
 

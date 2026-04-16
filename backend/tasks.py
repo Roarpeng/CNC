@@ -1,16 +1,14 @@
 import os
 import json
+import logging
 from pathlib import Path
 
-from celery.utils.log import get_task_logger
-
-from celery_app import celery_app
 from database import SessionLocal
 from models import CAMRecord, Job
 from services.cam_engine import CamEngineError, CamInputs, generate_cam_with_ocl
 from services.geometry_engine import GeometryEngineError, parse_step_with_cadquery
 
-logger = get_task_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 def _get_mesh_path(job_dir: str) -> Path | None:
@@ -31,8 +29,8 @@ def _set_job_state(job: Job, db, status: str, stage: str, progress: int, error_c
     db.commit()
 
 
-@celery_app.task(name="tasks.parse_step_task", bind=True, autoretry_for=(OSError,), retry_kwargs={"max_retries": 3, "countdown": 3})
-def parse_step_task(self, job_id: str, input_file_path: str, output_dir: str) -> dict:
+def parse_step_task(job_id: str, input_file_path: str, output_dir: str) -> dict:
+    """同步解析 STEP 文件，提取拓扑信息并生成网格文件。"""
     db = SessionLocal()
     try:
         job = db.query(Job).filter(Job.id == job_id).first()
@@ -61,6 +59,8 @@ def parse_step_task(self, job_id: str, input_file_path: str, output_dir: str) ->
                     {"face_id": 4, "normal": {"x": -1, "y": 0, "z": 0}, "center": {"x": 0, "y": 25, "z": 10}},
                     {"face_id": 5, "normal": {"x": 1, "y": 0, "z": 0}, "center": {"x": 50, "y": 25, "z": 10}},
                 ],
+                "manufacturing_features": [],
+                "feature_summary": {},
                 "render_file": "mock_model.obj",
             }
             _write_json(Path(output_dir) / "topology.json", topology)
@@ -76,8 +76,8 @@ def parse_step_task(self, job_id: str, input_file_path: str, output_dir: str) ->
         db.close()
 
 
-@celery_app.task(name="tasks.generate_cam_task", bind=True, autoretry_for=(OSError,), retry_kwargs={"max_retries": 3, "countdown": 3})
-def generate_cam_task(self, job_id: str, cam_req: dict) -> dict:
+def generate_cam_task(job_id: str, cam_req: dict) -> dict:
+    """同步生成 CAM 刀路和 G-Code。"""
     db = SessionLocal()
     try:
         job = db.query(Job).filter(Job.id == job_id).first()

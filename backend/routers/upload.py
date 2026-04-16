@@ -78,6 +78,8 @@ async def upload_step_file(file: UploadFile = File(...), db: Session = Depends(g
                 {"face_id": 4, "normal": {"x": -1, "y": 0, "z": 0}, "center": {"x": 0, "y": 25, "z": 10}},
                 {"face_id": 5, "normal": {"x": 1, "y": 0, "z": 0}, "center": {"x": 50, "y": 25, "z": 10}},
             ],
+            "manufacturing_features": [],
+            "feature_summary": {},
             "render_file": "mock_model.obj"
         }
         _write_json(output_dir / "topology.json", topology_data)

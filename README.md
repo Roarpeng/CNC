@@ -50,16 +50,9 @@ python -m venv .venv
 cd backend
 pip install -r requirements.txt
 uvicorn main:app --reload --host 0.0.0.0 --port 8000
-
-# 新增：启动异步 worker（另开终端）
-celery -A celery_app.celery_app worker -l info
-
-# 可选：使用 Docker 一键启动 PostgreSQL + Redis + Backend + Worker
-# 在项目根目录执行
-docker compose up --build
 ```
 
-后端运行于 `http://localhost:8000`
+后端运行于 `http://localhost:8000`（使用 SQLite 本地数据库，无需额外配置）
 
 ### 3. 启动前端
 
@@ -141,14 +134,16 @@ CNC/
 
 | 层级 | 技术 |
 | :--- | :--- |
-| **前端框架** | React 19 + TypeScript 6 + Vite 8 |
+| **前端框架** | React 19 + TypeScript + Vite |
 | **样式** | TailwindCSS v4 |
-| **3D 渲染** | Three.js 0.183 + @react-three/fiber + drei |
+| **3D 渲染** | Three.js + @react-three/fiber + drei |
 | **图标** | lucide-react |
 | **后端框架** | FastAPI + SQLAlchemy + SQLite |
 | **几何引擎** | CadQuery (OpenCASCADE) |
 | **CAM 引擎** | OpenCAMLib (Drop-cutter) |
 | **G-Code** | GRBL 兼容格式 |
+
+> 注：项目采用简化架构，所有请求同步处理，无需 Redis/Celery/PostgreSQL。适合开发测试和单用户场景。
 
 ---
 
@@ -159,9 +154,7 @@ CNC/
 | 变量 | 位置 | 默认值 | 说明 |
 | :--- | :--- | :--- | :--- |
 | `VITE_API_BASE_URL` | `frontend/.env` | `http://localhost:8000` | 后端 API 地址 |
-| `DATABASE_URL` | 系统环境变量 | `sqlite:///./cloudcam.db` | 可切换到 PostgreSQL（推荐生产） |
-| `CELERY_BROKER_URL` | 系统环境变量 | `redis://localhost:6379/0` | Celery Broker |
-| `CELERY_RESULT_BACKEND` | 系统环境变量 | 同 Broker | Celery 结果后端 |
+| `DATABASE_URL` | 系统环境变量 | `sqlite:///./cloudcam.db` | 数据库连接（默认 SQLite） |
 
 OpenCAMLib 绑定不可用时，`/api/v1/cam/generate/` 会自动降级为平面粗加工策略，并在返回 `stats.strategy` 中标记降级原因。
 

@@ -52,12 +52,13 @@ async def create_job(file: UploadFile = File(...), db: Session = Depends(get_db)
     db.add(job)
     db.commit()
 
-    parse_step_task.delay(job_id, str(file_path), str(output_dir))
+    result = parse_step_task(job_id, str(file_path), str(output_dir))
 
     return {
         "job_id": job_id,
-        "status": "queued",
-        "message": "任务已提交，正在异步解析",
+        "status": result.get("status", "parsed"),
+        "message": "文件解析完成",
+        "topology": result.get("topology"),
     }
 
 
@@ -98,12 +99,14 @@ def enqueue_cam(job_id: str, req: GenerateAsyncRequest, db: Session = Depends(ge
     if job.status not in {"parsed", "parsed_mock", "done"}:
         raise HTTPException(status_code=409, detail=f"当前状态 {job.status} 不允许提交 CAM 任务")
 
-    generate_cam_task.delay(job_id, req.model_dump())
+    result = generate_cam_task(job_id, req.model_dump())
 
     return {
         "job_id": job_id,
-        "status": "queued",
-        "message": "CAM 任务已提交",
+        "status": result.get("status", "done"),
+        "message": "G-Code 生成完成" if result.get("status") == "done" else result.get("error", "处理失败"),
+        "gcode_url": result.get("gcode_url"),
+        "estimated_time_minutes": result.get("estimated_time_minutes"),
     }
 
 

@@ -7,29 +7,37 @@ from typing import Optional
 from sqlalchemy.orm import Session
 from database import get_db
 from models import Job, CAMRecord
-from services.cam_engine import CamInputs, generate_cam_with_ocl, CamEngineError
+from services.cam_engine import (
+    CamInputs,
+    generate_cam_with_ocl,
+    CamEngineError,
+    select_tools_for_features,
+    get_tool_library,
+)
 
 router = APIRouter()
 
-SAFE_Z = 5.0        # 安全高度
-TOOL_DIAMETER = 6.0  # 默认刀具直径 mm
-STEP_OVER_RATIO = 0.4  # 行距 = 刀具直径 * 比例
+SAFE_Z = 5.0
+STEP_OVER_RATIO = 0.4
 
 
 def _write_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
+
+class FaceVector(BaseModel):
+    x: float
+    y: float
+    z: float
+
+
+class SelectedFacePayload(BaseModel):
+    face_index: int
+    normal: FaceVector
+    center: FaceVector
+
+
 class GenerateRequest(BaseModel):
-    class FaceVector(BaseModel):
-        x: float
-        y: float
-        z: float
-
-    class SelectedFacePayload(BaseModel):
-        face_index: int
-        normal: FaceVector
-        center: FaceVector
-
     job_id: str
     rough_tool_id: int
     rough_step_down: float
@@ -42,10 +50,17 @@ class GenerateRequest(BaseModel):
     volume: Optional[float] = None
     selected_face: Optional[SelectedFacePayload] = None
 
+@router.get("/tools/")
+async def list_tools():
+    """返回内置刀具库。"""
+    return {"tools": get_tool_library()}
+
+
 @router.post("/generate/")
 async def generate_toolpath(req: GenerateRequest, db: Session = Depends(get_db)):
     """
     使用 OpenCAMLib 生成 CAM 刀路；若运行时不可用则自动降级为平面粗加工。
+    自动根据识别到的加工特征选配刀具。
     """
     job = db.query(Job).filter(Job.id == req.job_id).first()
     if not job:
@@ -61,6 +76,14 @@ async def generate_toolpath(req: GenerateRequest, db: Session = Depends(get_db))
     job.error_code = None
     job.error_message = None
     db.commit()
+
+    topology = _read_topology(job_dir)
+    mfg_features = topology.get("manufacturing_features", []) if topology else []
+    part_dims = topology.get("features") if topology else None
+
+    tool_plan = select_tools_for_features(mfg_features, part_dims)
+    roughing_tool = tool_plan["roughing_tool"]
+    roughing_diameter = roughing_tool["diameter"]
 
     gcode_path = f"/static/{req.job_id}/output.nc"
     bx, by, bz = req.bbox_x, req.bbox_y, req.z_depth
@@ -89,7 +112,7 @@ async def generate_toolpath(req: GenerateRequest, db: Session = Depends(get_db))
                 step_down=req.rough_step_down,
                 spindle_speed=req.spindle_speed,
                 feed_rate=req.feed_rate,
-                tool_diameter=TOOL_DIAMETER,
+                tool_diameter=roughing_diameter,
                 step_over_ratio=STEP_OVER_RATIO,
                 safe_z=SAFE_Z,
                 setup_normal=(
@@ -118,6 +141,7 @@ async def generate_toolpath(req: GenerateRequest, db: Session = Depends(get_db))
             "estimated_time_minutes": cam_result["estimated_time_minutes"],
             "stats": cam_result["stats"],
             "toolpath_segments": toolpath_segments,
+            "tool_plan": tool_plan,
         })
         job.status = "done"
         job.stage = "completed"
@@ -133,13 +157,12 @@ async def generate_toolpath(req: GenerateRequest, db: Session = Depends(get_db))
         db.commit()
         raise HTTPException(status_code=500, detail=f"G-Code 生成失败: {str(e)}")
 
-    # 写入历史表
     cam_record = CAMRecord(
         model_volume=req.volume or (bx * by * bz),
         bbox_x=bx,
         bbox_y=by,
         z_depth=bz,
-        rough_tool_id=req.rough_tool_id,
+        rough_tool_id=roughing_tool["id"],
         rough_step_down=sd,
         spindle_speed=req.spindle_speed,
         feed_rate=req.feed_rate,
@@ -157,4 +180,15 @@ async def generate_toolpath(req: GenerateRequest, db: Session = Depends(get_db))
         "gcode_url": gcode_path,
         "toolpath_segments": toolpath_segments,
         "stats": cam_result["stats"],
+        "tool_plan": tool_plan,
     }
+
+
+def _read_topology(job_dir: str) -> dict | None:
+    topo_path = Path(job_dir) / "topology.json"
+    if not topo_path.exists():
+        return None
+    try:
+        return json.loads(topo_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
