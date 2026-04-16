@@ -2,11 +2,6 @@
 
 > **最后更新**: 2026-04-16 (v2 — 装夹面高亮/刀路坐标修正)
 
-## 0. 关联文档
-
-- SaaS 工业化改造 RFC: [rfc-saas-industrialization.md](rfc-saas-industrialization.md)
-- 4 人协作开发方案: [team-collaboration-plan.md](team-collaboration-plan.md)
-
 ## 1. 项目愿景与定位
 本项目定位于"**内部使用型 Web CAM 平台**"，面向车间和制造团队的内部工作流。允许操作人员通过浏览器直接完成模型上传、解析、刀路预览、G-Code 生成和下载的完整闭环，无需安装重型 CAM 软件。同时提供作业历史查询、参数推荐和回看能力，不追求大型 SaaS 复杂度，优先保证**上传 → 解析 → 预览 → 生成 → 下载** 单一主链路稳定可用。
 
@@ -344,4 +339,152 @@ cd frontend && npm run dev
 | rtree | ≥1.4 | trimesh 间接依赖（空间索引） |
 | OpenCAMLib | Optional | CAM 规划（运行时可选，失败自动降级） |
 
-> 注：当前采用简化架构，Conda 环境 `data`，无需 Redis/Celery/Docker。如需生产级高并发部署，可参考 `rfc-saas-industrialization.md`。
+> 注：当前采用简化架构，Conda 环境 `data`，无需 Redis/Celery/Docker。如需生产级高并发部署，可参考第 8 节 SaaS 工业化路线图。
+
+---
+
+## 8. 使用流程
+
+```
+上传 STEP 文件  →  查看 3D 模型  →  测量 / 选装夹面  →  调整工艺参数  →  生成 G-Code  →  查看刀路 / 下载
+```
+
+1. **上传** — 点击左侧上传区域，选择 `.step` 或 `.stp` 文件
+2. **预览** — 右侧 3D 区域自动加载模型，可旋转/平移/缩放
+3. **测量** — 点击工具栏「测量」按钮，在模型上点击两点查看距离
+4. **选面** — 点击工具栏「选择装夹面」，点击模型底面指定装夹位置
+5. **参数** — 左侧面板显示专家推荐参数，可手动编辑覆写
+6. **生成** — 点击「生成 G-Code」按钮，等待生成完成
+7. **查看** — 刀路自动叠加在 3D 模型上，红色=快移，青色=切削
+8. **下载** — 点击「下载 .nc 文件」获取 GRBL 兼容 G-Code
+
+---
+
+## 9. SaaS 工业化路线图（摘要）
+
+> 原文档: rfc-saas-industrialization.md (Draft, 2026-04-14)
+
+### 9.1 改造动机
+
+当前同步架构存在四个生产级风险：计算任务与请求生命周期耦合、本地文件链路无法跨实例扩容、SQLite 高并发写锁争用、缺少多租户/审计/可观测基础能力。
+
+### 9.2 目标架构（六层）
+
+| 层 | 技术选型 | 职责 |
+| :--- | :--- | :--- |
+| API 层 | FastAPI | 认证鉴权、参数校验、任务提交 |
+| 调度层 | Celery + Redis | 异步分发、重试、超时、死信 |
+| 计算层 | Worker 集群 | parse / cam / post 三类 worker |
+| 数据层 | PostgreSQL | 任务状态、工艺历史、租户权限 |
+| 对象存储层 | S3/MinIO | 上传原件、网格产物、G-Code |
+| 分发层 | CDN | GLB/G-Code 边缘加速 |
+
+### 9.3 任务状态机（目标态）
+
+`queued → parsing → meshing → cam_generating → postprocessing → completed / failed / canceled`
+
+### 9.4 失败码体系
+
+| 码 | 含义 |
+| :--- | :--- |
+| E1001 | 文件校验失败 |
+| E2001 | 几何解析失败 |
+| E3001 | OCL 计算失败 |
+| E3002 | OCL 降级执行 |
+| E4001 | 后处理失败 |
+| E5001 | 存储写入失败 |
+| E9001 | 未知异常 |
+
+### 9.5 数据库扩展要点
+
+- `jobs` 表新增 `tenant_id`、`project_id`、`user_id`、`input_hash`、`retry_count` 等字段
+- `cam_records` 增加 `material`、`machine_model`、`quality_score`、`ocl_strategy`
+- 新建租户/用户/权限/审计基础表
+
+### 9.6 Celery 编排
+
+- 队列拓扑：`q_parse_cpu` / `q_cam_cpu` / `q_postprocess_io` / `q_dead_letter`
+- DAG：`parse → cam → postprocess → publish`
+- 幂等策略：`input_hash` 去重 + 终态跳过 + 对象 key 存在性检查
+
+### 9.7 渲染产物升级
+
+- 前端主加载器升级为 GLTFLoader（GLB + Draco 压缩），保留 OBJ/STL fallback
+- CDN immutable 长缓存 + 签名下载链接
+
+### 9.8 安全与可观测
+
+- 上传：扩展名+MIME 双校验，拒绝压缩炸弹
+- 鉴权：JWT + API Key
+- 数据隔离：全部查询必须 `tenant_id` 过滤
+- 指标：API p95 延迟、队列排队时长、任务阶段耗时、失败率
+- SLO：提交接口可用性 99.9%、80MB 以下任务 30 分钟完成率 99%
+
+### 9.9 交付里程碑（4 个 PR 波次）
+
+| 波次 | 范围 | 周期 |
+| :--- | :--- | :--- |
+| PR-1 | Celery/Redis 基础 + v2 API | 1–2 周 |
+| PR-2 | PostgreSQL + Alembic 迁移 | 1–2 周 |
+| PR-3 | S3/MinIO + GLB+Draco 后处理 | 2 周 |
+| PR-4 | 多租户 RBAC + 审计 + 仪表盘 | 2 周 |
+
+### 9.10 风险与回滚
+
+- OCL 版本碎片化 → 适配层 + fallback + 版本白名单
+- 任务积压 → 队列分级 + worker 自动扩容
+- 双写不一致 → 灰度发布，先只读比对再切流
+- API v1 保留，v2 灰度开关；调度异常降级回同步模式
+
+---
+
+## 10. 4 人协作开发方案（摘要）
+
+> 原文档: team-collaboration-plan.md
+
+### 10.1 分工模型
+
+按责任边界（非前后端二分法）划分 4 条开发线：
+
+| 角色 | 职责范围 | 主责文件 |
+| :--- | :--- | :--- |
+| **A — 前端流程** | 上传/作业恢复/参数面板/结果面板/下载 | `App.tsx`, `App.css`, `index.css` |
+| **B — 前端 3D** | 模型加载/测量/选面/刀路叠加/渲染性能 | `ModelViewer.tsx`, `ToolpathViewer.tsx`, `ErrorBoundary.tsx` |
+| **C — 后端编排** | API 契约/DB 模型/状态机/错误码/任务编排 | `main.py`, `database.py`, `models.py`, `routers/*`, `tasks.py` |
+| **D — 几何/CAM** | STEP 解析/特征识别/OCL 接入/推荐引擎 | `geometry_engine.py`, `cam_engine.py`, `craftsman.py` |
+
+### 10.2 公共契约（并行前必须统一）
+
+- **Job 状态机**: `queued → parsing → parsed / parsed_mock → generating → done / failed`
+- **错误码**: E1001(文件校验) / E2001(解析) / E3001(CAM) / E5001(写入) / E9001(未知)
+- **topology.json 契约**: `features.*` + `faces[].face_id/normal/center` + `render_file`
+- **cam_result.json 契约**: `estimated_time_minutes` + `stats.*` + `toolpath_segments`
+
+### 10.3 迭代排期
+
+| 周 | 目标 | 验收标准 |
+| :--- | :--- | :--- |
+| 第 1 周 | 稳定主链路 | 标准样件跑通上传→下载；刷新可恢复；降级可识别 |
+| 第 2 周 | 提高可扩展性 | detail 接口恢复完整状态；异步接口可提交查询；fallback 模式可生成结果 |
+
+### 10.4 Git 协作策略
+
+- 分支：`main`（可运行版本） → `develop`（日常集成） → `feature/*`（个人功能）
+- 提交格式：`模块名: 动作 目的`（如 `backend: unify job status and error codes`）
+- PR 合并：说明改动范围 + 是否改契约 + 验证方式 + 跨模块影响；涉及公共契约需 2 人确认
+
+### 10.5 质量门槛
+
+- **前端**: 合并前 `npm run lint` + `npm run build` 通过
+- **后端**: 标准 STEP 文件上传成功、topology.json/cam_result.json 落盘、recent/detail 接口返回完整
+- **端到端**: 每周至少一次完整回归（上传→解析→预览→推荐→生成→刀路显示→下载→历史恢复）
+
+### 10.6 优先级原则
+
+当出现冲突时：主链路可用性 > 接口契约稳定性 > 模块边界清晰度 > 功能扩展速度
+
+---
+
+## 11. 许可证
+
+MIT
